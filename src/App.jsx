@@ -645,7 +645,7 @@ Athlete:
 - Today's WHOOP: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr} bpm, sleep ${whoop.sleepHours}h${whoop.sleepPerf ? ` (${whoop.sleepPerf}% performance)` : ""}, yesterday's strain ${whoop.strain}. Calibrate intensity to recovery: under 34% go much lighter, 34-66% moderate, above 66% full intensity.` : ""}${bc.ctx}
 - Recent workouts (most recent first): ${JSON.stringify(recent)}
 
-Build a full 7-day week, Monday to Sunday, with exactly ${p.days} training days and ${7 - p.days} rest days. Place rest days sensibly for recovery. Use ONLY the available equipment. Progress loads in small steps vs their history. Serve the specific goals directly. On rest days give a one-line recovery suggestion (walk, stretch, mobility).
+Build a full 7-day week, Monday to Sunday, with exactly ${p.days} training days and ${7 - p.days} rest days. Place rest days sensibly for recovery. Use ONLY the available equipment. Progress loads in small steps vs their history. Serve the specific goals directly. Give every TRAINING day its own one-line warm-up that primes the specific muscles and movements in that session. On rest days give a one-line recovery suggestion (walk, stretch, mobility) instead.
 ${deloadNow ? "IMPORTANT: This must be a DELOAD week. Cut loads to roughly 60% of their recent working weights and reduce total sets by about 40%. Keep the same movement patterns, keep everything far from failure, and say in \"why\" that this is a recovery week and why it earns them progress." : ""}
 
 Respond ONLY with valid JSON, no markdown fences, no preamble:
@@ -653,7 +653,7 @@ Respond ONLY with valid JSON, no markdown fences, no preamble:
  "why": "2-3 sentences on the structure of this week and how it serves their goals",
  "tip": "one specific coaching tip for this athlete right now",
  "week": [
-  {"day":"Mon","rest":false,"focus":"short session title","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short load guidance"}]},
+  {"day":"Mon","rest":false,"focus":"short session title","warmup":"one line warm-up specific to this session, e.g. 5 min bike then hip openers and 2 light sets of the first lift","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short load guidance"}]},
   {"day":"Tue","rest":true,"note":"one-line recovery suggestion"}
  ]
 }
@@ -704,7 +704,7 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
         })),
       };
     });
-    const lv = { startedAt: Date.now(), date: todayStr, idx: 0, focus: dayObj.focus || "", exercises: sessionEx };
+    const lv = { startedAt: Date.now(), date: todayStr, idx: 0, focus: dayObj.focus || "", warmup: dayObj.warmup || "", warmupDone: false, exercises: sessionEx };
     setLive(lv); persist({ live: lv });
     setRestEnd(null);
     setTab("live");
@@ -869,13 +869,13 @@ Rules:
 - Keep the same day name and a similar exercise count. Use ONLY the available equipment.
 
 Respond ONLY with valid JSON, no markdown fences:
-{"day":"${dy.day}","rest":false,"focus":"session title","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
+{"day":"${dy.day}","rest":false,"focus":"session title","warmup":"one line warm-up for this session","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
     try {
       const clean = await askClaude(prompt, 1200);
       const adj = parseJson(clean);
       const np = JSON.parse(JSON.stringify(plan));
       np.originalDay = { idx: todayIdx, day: dy };
-      np.week[todayIdx] = { day: adj.day || dy.day, rest: false, focus: adj.focus || dy.focus, exercises: adj.exercises || dy.exercises };
+      np.week[todayIdx] = { day: adj.day || dy.day, rest: false, focus: adj.focus || dy.focus, warmup: adj.warmup || dy.warmup, exercises: adj.exercises || dy.exercises };
       np.adjustedDate = todayStr;
       np.adjustNote = adj.adjust_note || "Adjusted to today's recovery.";
       np.adjustRecovery = w.recovery;
@@ -1667,6 +1667,18 @@ Respond ONLY with valid JSON, no markdown fences:
                         </div>
                       ) : (
                         <>
+                          {dy.warmup && (
+                            <div style={{
+                              background: T.goodDim, borderLeft: `2px solid ${T.good}`, borderRadius: 8,
+                              padding: "10px 13px", margin: "4px 0 12px", fontSize: 13, lineHeight: 1.5,
+                            }}>
+                              <span style={{
+                                fontSize: 9.5, color: T.good, textTransform: "uppercase",
+                                letterSpacing: "0.14em", fontWeight: 600, display: "block", marginBottom: 4,
+                              }}>Warm-up</span>
+                              {dy.warmup}
+                            </div>
+                          )}
                           {(dy.exercises || []).map((e, i) => {
                             const perf = lastPerfFor(e.exercise);
                             return (
@@ -1741,6 +1753,23 @@ Respond ONLY with valid JSON, no markdown fences:
                 <div style={{ ...display, fontSize: 24 }}>{live.focus || "Live session"}</div>
                 <div style={{ fontSize: 13, color: T.sub }}>{elapsedMin} min · {totalDone} sets done</div>
               </div>
+
+              {live.warmup && !live.warmupDone && (
+                <div style={{
+                  ...S.card, background: T.goodDim, borderColor: T.line,
+                  borderLeft: `2px solid ${T.good}`,
+                }}>
+                  <div style={{
+                    fontSize: 9.5, color: T.good, textTransform: "uppercase",
+                    letterSpacing: "0.14em", fontWeight: 600, marginBottom: 6,
+                  }}>Warm-up first</div>
+                  <div style={{ fontSize: 14, lineHeight: 1.55, marginBottom: 12 }}>{live.warmup}</div>
+                  <button style={{ ...S.ghost, width: "100%" }}
+                    onClick={() => updLive((nl) => { nl.warmupDone = true; }, true)}>
+                    ✓ Warm-up done
+                  </button>
+                </div>
+              )}
 
               {restEnd && (
                 <div style={{
