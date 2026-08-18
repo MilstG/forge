@@ -244,35 +244,144 @@ app.put("/api/exinfo", (req, res) => {
 });
 
 /* ---- Claude proxy: keeps your API key server-side ---- */
-/* ---- Claude helper (used by the API route and the auto-adjust scheduler) ---- */
-async function callClaude(prompt, maxTokens = 1500) {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error("ANTHROPIC_API_KEY is not set");
+/* ================= AI provider =================
+   Set ONE of these in Railway → Variables:
+     OPENAI_API_KEY      → uses OpenAI  (recommended cheap models below)
+     ANTHROPIC_API_KEY   → uses Claude
+   Optional: OPENAI_MODEL / ANTHROPIC_MODEL to pin a specific model.
+   If unset, the server asks the provider which models your account has
+   and picks the cheapest capable one from PREFERRED_OPENAI. */
+const OPENAI_KEY = (process.env.OPENAI_API_KEY || "").trim();
+const ANTHROPIC_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
+const PROVIDER = (process.env.AI_PROVIDER || (OPENAI_KEY ? "openai" : ANTHROPIC_KEY ? "anthropic" : "")).toLowerCase();
+
+// cheapest-first: model names churn, so we match against what your account offers
+const PREFERRED_OPENAI = [
+  "gpt-5.6-luna", "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.6-terra",
+  "gpt-5.4", "gpt-5.2-chat-latest", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini",
+];
+let resolvedModel = null;
+
+async function openaiModels() {
+  const r = await fetch("https://api.openai.com/v1/models", {
+    headers: { Authorization: "Bearer " + OPENAI_KEY },
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error(`OpenAI /models (${r.status}): ${(e.error && e.error.message) || "request failed"}`);
+  }
+  const d = await r.json();
+  return (d.data || []).map((m) => m.id);
+}
+
+async function resolveModel() {
+  if (resolvedModel) return resolvedModel;
+  if (PROVIDER === "anthropic") {
+    resolvedModel = process.env.ANTHROPIC_MODEL || process.env.MODEL || "claude-sonnet-5";
+    return resolvedModel;
+  }
+  const pinned = process.env.OPENAI_MODEL || process.env.MODEL;
+  if (pinned) { resolvedModel = pinned.trim(); return resolvedModel; }
+  try {
+    const ids = await openaiModels();
+    for (const want of PREFERRED_OPENAI) {
+      const hit = ids.find((id) => id === want) || ids.find((id) => id.startsWith(want));
+      if (hit) { resolvedModel = hit; console.log("[ai] auto-selected model:", hit); return hit; }
+    }
+    // nothing from the preference list — fall back to any chat-capable gpt id
+    const any = ids.filter((id) => /^gpt-/.test(id)).sort()[0];
+    if (any) { resolvedModel = any; console.log("[ai] falling back to model:", any); return any; }
+    throw new Error("No usable GPT model found on this account.");
+  } catch (e) {
+    console.error("[ai] model discovery failed:", String(e.message || e));
+    throw e;
+  }
+}
+
+/* Single entry point for all AI calls (used by the API route and the scheduler) */
+async function callAI(prompt, maxTokens = 1500) {
+  if (!PROVIDER) {
+    throw new Error("No AI key set. Add OPENAI_API_KEY (or ANTHROPIC_API_KEY) in Railway → Variables.");
+  }
+  const model = await resolveModel();
+  const cap = Math.min(Math.max(maxTokens || 1500, 4000), 16000);
+
+  if (PROVIDER === "openai") {
+    const body = {
+      model,
+      messages: [{ role: "user", content: String(prompt || "") }],
+      // every prompt in this app asks for JSON; this makes parsing reliable
+      response_format: { type: "json_object" },
+      // newer OpenAI models require max_completion_tokens and reject max_tokens
+      max_completion_tokens: cap,
+    };
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", Authorization: "Bearer " + OPENAI_KEY },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      const msg = (data.error && data.error.message) || JSON.stringify(data).slice(0, 300);
+      throw new Error(`OpenAI (${r.status}, model ${model}): ${msg}`);
+    }
+    const choice = (data.choices || [])[0] || {};
+    const text = (choice.message && choice.message.content) || "";
+    if (!text.trim()) throw new Error(`Model returned no text (finish_reason: ${choice.finish_reason || "unknown"}). Try a higher token limit.`);
+    return text;
+  }
+
+  // Anthropic
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": key,
+      "x-api-key": ANTHROPIC_KEY,
       "anthropic-version": "2023-06-01",
     },
-    body: JSON.stringify({
-      model: process.env.MODEL || "claude-sonnet-4-6",
-      max_tokens: Math.min(maxTokens || 1500, 4000),
-      messages: [{ role: "user", content: String(prompt || "") }],
-    }),
+    body: JSON.stringify({ model, max_tokens: cap, messages: [{ role: "user", content: String(prompt || "") }] }),
   });
   const data = await r.json();
-  if (!r.ok) throw new Error((data.error && data.error.message) || "api error");
-  return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  if (!r.ok) {
+    const msg = (data.error && data.error.message) || JSON.stringify(data).slice(0, 300);
+    throw new Error(`Claude API (${r.status}, model ${model}): ${msg}`);
+  }
+  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  if (!text.trim()) throw new Error(`Model returned no text (stop_reason: ${data.stop_reason || "unknown"}).`);
+  return text;
 }
 
 app.post("/api/claude", async (req, res) => {
   try {
-    const text = await callClaude(req.body.prompt, +req.body.max_tokens || 1500);
+    const text = await callAI(req.body.prompt, +req.body.max_tokens || 1500);
     res.json({ text });
   } catch (e) {
+    console.error("[ai]", String(e.message || e));
     res.status(502).json({ error: String(e.message || e) });
   }
+});
+
+/* Public, secret-free diagnostics for the AI side */
+app.get("/api/ai/diag", async (req, res) => {
+  const out = {
+    provider: PROVIDER || "none — set OPENAI_API_KEY or ANTHROPIC_API_KEY",
+    openai_key_set: !!OPENAI_KEY,
+    anthropic_key_set: !!ANTHROPIC_KEY,
+    pinned_model: process.env.OPENAI_MODEL || process.env.ANTHROPIC_MODEL || process.env.MODEL || null,
+    resolved_model: resolvedModel,
+  };
+  try {
+    out.resolved_model = await resolveModel();
+    out.ok = true;
+  } catch (e) {
+    out.ok = false;
+    out.error = String(e.message || e);
+  }
+  if (req.query.models === "1" && PROVIDER === "openai") {
+    try { out.available_models = (await openaiModels()).filter((m) => /^(gpt|o[0-9])/.test(m)).sort(); }
+    catch (e) { out.available_models_error = String(e.message || e); }
+  }
+  res.json(out);
 });
 
 /* ---- background auto-adjust ----
@@ -295,7 +404,7 @@ const weekdayIdxInTz = () => {
 async function autoAdjustCheck() {
   try {
     if ((process.env.AUTO_ADJUST || "on") === "off") return;
-    if (!process.env.ANTHROPIC_API_KEY) return;
+    if (!PROVIDER) return;
     const data = readJson("forge.json", null);
     if (!data || !data.profile || !data.plan || !Array.isArray(data.plan.week)) return;
     const today = dateInTz();
@@ -333,7 +442,7 @@ Rules:
 Respond ONLY with valid JSON, no markdown fences:
 {"day":"${dy.day}","rest":false,"focus":"session title","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
 
-    const text = await callClaude(prompt, 1200);
+    const text = await callAI(prompt, 1200);
     const adj = JSON.parse(text.replace(/```json|```/g, "").trim());
     data.plan.originalDay = { idx, day: dy };
     data.plan.week[idx] = {
