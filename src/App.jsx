@@ -132,6 +132,161 @@ const groupFor = (name) => {
   return "Other";
 };
 
+/* ================= exercise name normalization =================
+   Free-text logging fragments the same lift across spellings
+   ("Bench press" / "bench Press" / "Barbell bench press"), which
+   splits PRs, muscle stats and readiness. canonicalName() folds a
+   typed name onto one canonical label. */
+const ALIASES = {
+  "back squat": ["barbell squat", "bb squat", "squat", "squats", "high bar squat", "low bar squat"],
+  "front squat": ["front barbell squat", "fsquat"],
+  "goblet squat": ["kb goblet squat", "db goblet squat"],
+  "bodyweight squat": ["air squat", "bw squat"],
+  "leg press": ["legpress", "machine leg press"],
+  "lunge": ["lunges", "forward lunge", "db lunge", "dumbbell lunge"],
+  "walking lunge": ["walking lunges"],
+  "bulgarian split squat": ["bss", "split squat", "rear foot elevated split squat", "rfess"],
+  "leg extension": ["leg extensions", "quad extension"],
+  "leg curl": ["leg curls", "hamstring curl", "lying leg curl"],
+  "calf raise": ["calf raises", "standing calf raise"],
+  "deadlift": ["conventional deadlift", "dl", "barbell deadlift"],
+  "romanian deadlift": ["rdl", "rdls", "romanian dl", "stiff leg deadlift", "sldl"],
+  "sumo deadlift": ["sumo dl"],
+  "kettlebell swing": ["kb swing", "kb swings", "kettlebell swings", "swing"],
+  "hip thrust": ["barbell hip thrust", "hip thrusts"],
+  "glute bridge": ["glute bridges"],
+  "good morning": ["good mornings"],
+  "bench press": ["bench", "barbell bench press", "bb bench", "flat bench press", "bench press flat"],
+  "incline bench press": ["incline bench", "incline barbell press"],
+  "dumbbell bench press": ["db bench press", "db bench", "dumbbell bench"],
+  "incline dumbbell press": ["incline db press", "incline dumbbell bench press"],
+  "push-up": ["pushup", "push up", "pushups", "push ups", "press up"],
+  "dip": ["dips", "triceps dip", "chest dip"],
+  "chest fly": ["dumbbell fly", "db fly", "flyes", "chest flies", "pec fly"],
+  "cable fly": ["cable crossover", "cable flyes"],
+  "overhead press": ["ohp", "military press", "shoulder press", "barbell shoulder press", "strict press"],
+  "dumbbell shoulder press": ["db shoulder press", "db overhead press"],
+  "arnold press": ["arnolds"],
+  "lateral raise": ["lat raise", "side raise", "lateral raises", "side lateral raise"],
+  "front raise": ["front raises"],
+  "rear delt fly": ["reverse fly", "rear delt raise", "reverse flyes"],
+  "upright row": ["upright rows"],
+  "shrug": ["shrugs", "barbell shrug", "db shrug"],
+  "face pull": ["face pulls"],
+  "pull-up": ["pullup", "pull up", "pullups", "pull ups"],
+  "chin-up": ["chinup", "chin up", "chinups", "chin ups"],
+  "lat pulldown": ["pulldown", "lat pull down", "lat pulldowns"],
+  "barbell row": ["bent over row", "bb row", "bent-over barbell row", "pendlay row"],
+  "dumbbell row": ["db row", "one arm dumbbell row", "single arm row"],
+  "seated cable row": ["cable row", "seated row"],
+  "t-bar row": ["tbar row", "t bar row"],
+  "band row": ["resistance band row"],
+  "hyperextension": ["back extension", "hyperextensions", "back extensions"],
+  "biceps curl": ["bicep curl", "curl", "curls", "db curl", "dumbbell curl", "bicep curls"],
+  "barbell curl": ["bb curl", "ez bar curl", "ez-bar curl"],
+  "hammer curl": ["hammer curls"],
+  "preacher curl": ["preacher curls"],
+  "triceps extension": ["tricep extension", "overhead tricep extension", "tricep extensions"],
+  "skullcrusher": ["skull crusher", "skullcrushers", "lying tricep extension"],
+  "triceps pushdown": ["tricep pushdown", "pushdown", "cable pushdown", "rope pushdown"],
+  "close-grip bench press": ["close grip bench", "cgbp"],
+  "plank": ["planks", "front plank"],
+  "side plank": ["side planks"],
+  "crunch": ["crunches", "ab crunch"],
+  "sit-up": ["situp", "sit up", "situps", "sit ups"],
+  "hanging leg raise": ["hanging leg raises", "leg raise", "leg raises"],
+  "russian twist": ["russian twists"],
+  "mountain climber": ["mountain climbers"],
+  "ab wheel": ["ab roller", "ab wheel rollout"],
+  "cable crunch": ["kneeling cable crunch"],
+  "farmer's walk": ["farmers walk", "farmer walk", "farmers carry"],
+  "clean": ["power clean", "hang clean"],
+  "snatch": ["power snatch"],
+  "clean and jerk": ["c&j"],
+  "thruster": ["thrusters"],
+  "burpee": ["burpees"],
+  "box jump": ["box jumps"],
+  "run": ["running", "jog", "jogging", "treadmill"],
+  "bike": ["cycling", "bicycle", "stationary bike", "spin"],
+  "rowing machine": ["rower", "erg", "row machine", "concept2"],
+  "jump rope": ["skipping", "skip rope"],
+  "elliptical": ["cross trainer"],
+};
+const ALIAS_LOOKUP = (() => {
+  const m = {};
+  Object.entries(ALIASES).forEach(([canon, list]) => {
+    m[canon] = canon;
+    list.forEach((a) => { if (!m[a]) m[a] = canon; });
+  });
+  LIB.forEach((e) => { const k = e.name.toLowerCase(); if (!m[k]) m[k] = k; });
+  return m;
+})();
+const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const canonicalName = (raw) => {
+  const t = (raw || "").trim();
+  if (!t) return t;
+  let n = t.toLowerCase().replace(/\s+/g, " ").replace(/[.]/g, "");
+  if (ALIAS_LOOKUP[n]) return titleCase(ALIAS_LOOKUP[n]);
+  const stripped = n.replace(/^(barbell|dumbbell|db|bb|cable|machine|smith machine|kettlebell|kb|banded|band|resistance band|seated|standing) /, "");
+  if (ALIAS_LOOKUP[stripped]) return titleCase(ALIAS_LOOKUP[stripped]);
+  const singular = n.replace(/s$/, "");
+  if (ALIAS_LOOKUP[singular]) return titleCase(ALIAS_LOOKUP[singular]);
+  return t.replace(/\s+/g, " ");
+};
+
+/* ---------- estimated 1RM (Epley) ----------
+   Top weight alone hides progress: 100kg x 5 beats 105kg x 1.
+   Capped at 12 reps where the formula stops being meaningful. */
+const estimate1RM = (weight, reps) => {
+  const w = +weight || 0, r = +reps || 0;
+  if (!w || !r || r > 12) return 0;
+  return Math.round(w * (1 + r / 30));
+};
+
+/* ---------- exercise photos (free-exercise-db, public domain) ---------- */
+const EXPHOTO = {"ab wheel":"Ab_Roller", "arnold press":"Arnold_Dumbbell_Press", "back squat":"Barbell_Squat", "band row":"Seated_Cable_Rows", "barbell curl":"Barbell_Curl", "barbell row":"Bent_Over_Barbell_Row", "bench press":"Barbell_Bench_Press_-_Medium_Grip", "biceps curl":"Dumbbell_Bicep_Curl", "bike":"Bicycling_Stationary", "bodyweight squat":"Bodyweight_Squat", "box jump":"Front_Box_Jump", "bulgarian split squat":"Dumbbell_Rear_Lunge", "cable crunch":"Cable_Crunch", "cable fly":"Cable_Crossover", "calf raise":"Standing_Calf_Raises", "chest fly":"Dumbbell_Flyes", "chin-up":"Chin-Up", "clean":"Power_Clean", "clean and jerk":"Clean_and_Jerk", "close-grip bench press":"Close-Grip_Barbell_Bench_Press", "crunch":"Crunches", "deadlift":"Barbell_Deadlift", "dip":"Dips_-_Triceps_Version", "dumbbell bench press":"Dumbbell_Bench_Press", "dumbbell row":"One-Arm_Dumbbell_Row", "dumbbell shoulder press":"Dumbbell_Shoulder_Press", "elliptical":"Elliptical_Trainer", "face pull":"Face_Pull", "farmer's walk":"Farmers_Walk", "front raise":"Front_Dumbbell_Raise", "front squat":"Front_Barbell_Squat", "glute bridge":"Butt_Lift_Bridge", "goblet squat":"Goblet_Squat", "good morning":"Good_Morning", "hammer curl":"Hammer_Curls", "hanging leg raise":"Hanging_Leg_Raise", "hip thrust":"Barbell_Hip_Thrust", "hyperextension":"Hyperextensions_Back_Extensions", "incline bench press":"Barbell_Incline_Bench_Press_-_Medium_Grip", "incline dumbbell press":"Incline_Dumbbell_Press", "jump rope":"Rope_Jumping", "kettlebell swing":"One-Arm_Kettlebell_Swings", "lat pulldown":"Wide-Grip_Lat_Pulldown", "lateral raise":"Side_Lateral_Raise", "leg curl":"Lying_Leg_Curls", "leg extension":"Leg_Extensions", "leg press":"Leg_Press", "lunge":"Dumbbell_Lunges", "mountain climber":"Mountain_Climbers", "overhead press":"Barbell_Shoulder_Press", "plank":"Plank", "preacher curl":"Preacher_Curl", "pull-up":"Pullups", "push-up":"Pushups", "rear delt fly":"Reverse_Flyes", "romanian deadlift":"Romanian_Deadlift", "rowing machine":"Rowing_Stationary", "run":"Running_Treadmill", "russian twist":"Russian_Twist", "seated cable row":"Seated_Cable_Rows", "shrug":"Barbell_Shrug", "side plank":"Side_Bridge", "sit-up":"Sit-Up", "skullcrusher":"EZ-Bar_Skullcrusher", "snatch":"Power_Snatch", "sumo deadlift":"Sumo_Deadlift", "t-bar row":"T-Bar_Row_with_Handle", "thruster":"Kettlebell_Thruster", "triceps extension":"Triceps_Pushdown", "triceps pushdown":"Triceps_Pushdown", "upright row":"Upright_Barbell_Row", "walking lunge":"Barbell_Walking_Lunge", "wrist curl":"Palms-Up_Barbell_Wrist_Curl_Over_A_Bench"};
+const PHOTO_BASE = "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/";
+const photoFor = (name) => {
+  const k = canonicalName(name).toLowerCase();
+  const id = EXPHOTO[k];
+  return id ? [PHOTO_BASE + id + "/0.jpg", PHOTO_BASE + id + "/1.jpg"] : null;
+};
+
+/* Start/finish photo pair; falls back to the animated pictogram. */
+const ExPhoto = ({ name, fallback = null }) => {
+  const pair = photoFor(name);
+  const [frame, setFrame] = useState(0);
+  const [dead, setDead] = useState(false);
+  useEffect(() => {
+    setFrame(0); setDead(false);
+  }, [name]);
+  useEffect(() => {
+    if (!pair || dead) return undefined;
+    const t = setInterval(() => setFrame((f) => 1 - f), 1600);
+    return () => clearInterval(t);
+  }, [name, dead]);
+  if (!pair || dead) return fallback;
+  return (
+    <div style={{
+      position: "relative", width: "100%", aspectRatio: "4 / 3", marginBottom: 14,
+      borderRadius: 12, overflow: "hidden", background: T.surface2, border: `1px solid ${T.line}`,
+    }}>
+      {pair.map((u, i) => (
+        <img key={u} src={u} alt="" onError={() => setDead(true)} loading="lazy"
+          style={{
+            position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover",
+            opacity: i === frame ? 1 : 0, transition: "opacity 0.4s",
+          }} />
+      ))}
+      <div style={{
+        position: "absolute", bottom: 8, right: 9, fontSize: 10.5, color: T.text,
+        background: "rgba(11,12,15,0.72)", padding: "3px 9px", borderRadius: 999,
+        fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.1em",
+      }}>{frame === 0 ? "Start" : "Finish"}</div>
+    </div>
+  );
+};
+
 /* ================= muscle readiness body map ================= */
 /* ---------- 1 · Readiness model ----------
    Each logged set adds fatigue to its muscle group, decaying with a
@@ -465,6 +620,7 @@ let APP_TOKEN = null;
 try { APP_TOKEN = localStorage.getItem("forge-token"); } catch (e) {}
 // HTTP headers can't carry non-ASCII (accents, ñ, emoji), so the token is
 // percent-encoded here and decoded server-side.
+const PENDING_KEY = "forge-pending-save";
 const apiHeaders = () => ({
   "Content-Type": "application/json",
   ...(APP_TOKEN ? { "x-app-token": encodeURIComponent(APP_TOKEN) } : {}),
@@ -519,6 +675,8 @@ export default function Forge() {
   const [addInj, setAddInj] = useState("");
   const [adjBusy, setAdjBusy] = useState(false);
   const autoAdj = useRef(false);
+  const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  const [queued, setQueued] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
   const [pw, setPw] = useState("");
@@ -621,8 +779,25 @@ export default function Forge() {
   const persist = async (patch = {}) => {
     const full = { profile, workouts, bodyLog, plan, insights, live, reviewedWeek, block, nutrition, checkins, measurements, ...patch };
     try {
-      await fetch("/api/data", { method: "PUT", headers: apiHeaders(), body: JSON.stringify(full) });
-    } catch (e) { console.error("save failed", e); }
+      const r = await fetch("/api/data", { method: "PUT", headers: apiHeaders(), body: JSON.stringify(full) });
+      if (!r.ok) throw new Error("save failed");
+      if (localStorage.getItem(PENDING_KEY)) { localStorage.removeItem(PENDING_KEY); setQueued(0); }
+    } catch (e) {
+      /* offline or server unreachable: keep the newest full snapshot on device */
+      try { localStorage.setItem(PENDING_KEY, JSON.stringify(full)); setQueued((n) => n + 1); } catch (e2) {}
+    }
+  };
+
+  /* flush a queued snapshot once the connection is back */
+  const flushPending = async () => {
+    const raw = localStorage.getItem(PENDING_KEY);
+    if (!raw) return;
+    try {
+      const r = await fetch("/api/data", { method: "PUT", headers: apiHeaders(), body: raw });
+      if (!r.ok) throw new Error("save failed");
+      localStorage.removeItem(PENDING_KEY);
+      setQueued(0);
+    } catch (e) {}
   };
 
   useEffect(() => {
@@ -677,6 +852,26 @@ export default function Forge() {
     if (!prs[k] || wt > prs[k].weight) prs[k] = { name: e.name.trim(), weight: wt, date: w.date, reps: +e.reps || 1 };
   }));
   const prList = Object.values(prs).sort((a, b) => b.weight - a.weight);
+
+  /* best estimated 1RM per lift, and its trend over time */
+  const e1rmBest = {};
+  workouts.forEach((w) => w.exercises.forEach((e) => {
+    const v = estimate1RM(e.weight, e.reps);
+    if (!v) return;
+    const k = e.name.trim().toLowerCase();
+    if (!e1rmBest[k] || v > e1rmBest[k].value) e1rmBest[k] = { name: e.name.trim(), value: v, date: w.date };
+  }));
+  const e1rmList = Object.values(e1rmBest).sort((a, b) => b.value - a.value);
+  const e1rmSeriesFor = (name) => {
+    const k = (name || "").trim().toLowerCase();
+    return [...workouts]
+      .filter((w) => w.exercises.some((e) => e.name.trim().toLowerCase() === k && estimate1RM(e.weight, e.reps)))
+      .sort((a, b) => (a.date < b.date ? -1 : 1))
+      .map((w, i) => ({
+        x: i, date: w.date,
+        y: Math.max(...w.exercises.filter((e) => e.name.trim().toLowerCase() === k).map((e) => estimate1RM(e.weight, e.reps))),
+      }));
+  };
 
   const weekKey = (dstr) => {
     const dt = new Date(dstr + "T00:00:00");
@@ -983,6 +1178,15 @@ export default function Forge() {
   })();
   const todayCheckin = checkins.find((c) => c.date === todayStr) || null;
 
+  /* per-muscle readiness, also fed to the coach */
+  const readiness = muscleReadiness(workouts, checkins, todayStr);
+  const readinessLine = Object.entries(readiness)
+    .filter(([, v]) => v.status !== "untracked")
+    .map(([g, v]) => `${g}: ${v.status} (${v.sets7} sets last 7d)`)
+    .join("; ");
+  const readyGroups = Object.entries(readiness).filter(([, v]) => v.status === "ready").map(([g]) => g);
+  const fatiguedGroups = Object.entries(readiness).filter(([, v]) => v.status === "fatigued").map(([g]) => g);
+
   // --- body measurements ---
   const MEAS = [["waist", "Waist"], ["chest", "Chest"], ["arms", "Arms"], ["thighs", "Thighs"]];
   const measSorted = [...measurements].sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -1126,6 +1330,48 @@ export default function Forge() {
   const blockPhase = block && block.weeks && blockWeek >= 1 && blockWeek <= block.weeks.length
     ? (block.weeks.find((w) => w.week === blockWeek) || block.weeks[blockWeek - 1]) : null;
 
+  /* ----- one-time exercise name cleanup ----- */
+  const nameMigration = useRef(false);
+  useEffect(() => {
+    if (!loaded || nameMigration.current || !workouts.length) return;
+    if (localStorage.getItem("forge-names-v1")) { nameMigration.current = true; return; }
+    nameMigration.current = true;
+    let changed = 0;
+    const next = workouts.map((w) => ({
+      ...w,
+      exercises: w.exercises.map((e) => {
+        const c = canonicalName(e.name);
+        if (c !== e.name) changed++;
+        return { ...e, name: c };
+      }),
+    }));
+    localStorage.setItem("forge-names-v1", "1");
+    if (changed) {
+      setWorkouts(next);
+      persist({ workouts: next });
+      setFlash(`Tidied ${changed} exercise name${changed > 1 ? "s" : ""}`);
+      setTimeout(() => setFlash(""), 2600);
+    }
+    // eslint-disable-next-line
+  }, [loaded, workouts.length]);
+
+  /* ----- connectivity ----- */
+  useEffect(() => {
+    const up = () => { setOnline(true); flushPending(); };
+    const down = () => setOnline(false);
+    window.addEventListener("online", up);
+    window.addEventListener("offline", down);
+    if (navigator.onLine) flushPending();
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
+    // eslint-disable-next-line
+  }, []);
+
+  useEffect(() => {
+    if (localStorage.getItem(PENDING_KEY)) setQueued(1);
+  }, [loaded]);
+
   /* ---------- actions ---------- */
   const saveProfile = () => {
     const p = { ...d, days: +d.days || 3 };
@@ -1137,7 +1383,7 @@ export default function Forge() {
   };
 
   const saveWorkout = () => {
-    const clean = exs.filter((e) => e.name.trim());
+    const clean = exs.filter((e) => e.name.trim()).map((e) => ({ ...e, name: canonicalName(e.name) }));
     if (!clean.length) { setFlash("Add at least one exercise"); setTimeout(() => setFlash(""), 1800); return; }
     const newPRs = clean
       .filter((e) => {
@@ -1188,7 +1434,8 @@ Athlete:
 - Recent workouts (most recent first, rpe is 1-10 perceived effort where given): ${JSON.stringify(recent)}${avgRpe ? `
 - Average logged RPE: ${avgRpe}. If recent RPE at given loads is 9+, hold or reduce load rather than adding weight; if 6 or below, add a larger jump.` : ""}${todayCheckin && (todayCheckin.soreness || []).length ? `
 - Reported sore today: ${todayCheckin.soreness.join(", ")} — avoid hammering these, or program them lightly.` : ""}${sorenessCount.length ? `
-- Frequently sore areas recently: ${sorenessCount.slice(0, 3).map(([g, n]) => `${g} (${n}x)`).join(", ")}.` : ""}${RATIOS.filter((r) => r.verdict === "low").length ? `
+- Frequently sore areas recently: ${sorenessCount.slice(0, 3).map(([g, n]) => `${g} (${n}x)`).join(", ")}.` : ""}${readinessLine ? `
+- Per-muscle readiness right now (estimated from set volume with a 38h fatigue half-life): ${readinessLine}.${fatiguedGroups.length ? ` Fatigued: ${fatiguedGroups.join(", ")} — do not program these hard in the first 1-2 days of the week; give them at least 48h before heavy work.` : ""}${readyGroups.length ? ` Ready to train hard: ${readyGroups.join(", ")} — front-load these early in the week.` : ""}` : ""}${RATIOS.filter((r) => r.verdict === "low").length ? `
 - Strength imbalances to address: ${RATIOS.filter((r) => r.verdict === "low").map((r) => r.label + " is low").join("; ")}. Bias volume toward the lagging lift.` : ""}${goalRange && repRanges.tot > 20 && repRanges.pct[goalRange] < 50 ? `
 - Rep-range mismatch: their goal calls for ${goalRange} reps but only ${repRanges.pct[goalRange]}% of sets are there. Correct this.` : ""}${stale.length ? `
 - Movements they have dropped for 3+ weeks: ${stale.map((e) => e.name).join(", ")}. Reintroduce if useful.` : ""}
@@ -1277,7 +1524,7 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
       const weight = Math.max(...ds.map((s) => +s.weight || 0));
       const rpes = ds.map((x) => +x.rpe).filter((v) => v > 0);
       return {
-        name: ex.name,
+        name: canonicalName(ex.name),
         sets: String(ds.length),
         reps: String(ds[ds.length - 1].reps || ""),
         weight: weight ? String(weight) : "",
@@ -1438,11 +1685,13 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
 Athlete: ${profile.level}, goal ${profile.goal}.${(profile.injuries || []).length ? ` Injuries: ${profile.injuries.join("; ")}.` : ""}
 Equipment: ${gearLabels.join(", ")}.
 WHOOP today: recovery ${w.recovery}%, HRV ${w.hrv} ms, RHR ${w.rhr} bpm, sleep ${w.sleepHours}h, yesterday's strain ${w.strain}.
-Planned session: ${JSON.stringify(dy)}
+Planned session: ${JSON.stringify(dy)}${readinessLine ? `
+Per-muscle readiness today: ${readinessLine}.` : ""}
 
 Rules:
 - Recovery under 34% (red): cut loads 20-30%, drop roughly one set per exercise, and swap the most CNS-taxing lifts (heavy squats/deadlifts) for gentler variants.
 - Recovery 34-66% (yellow): trim loads about 10% and reduce total sets slightly. Keep the session's structure.
+- If a muscle group is listed as fatigued and today's session targets it, prefer swapping that work toward a ready group over simply cutting load.
 - Keep the same day name and a similar exercise count. Use ONLY the available equipment.
 
 Respond ONLY with valid JSON, no markdown fences:
@@ -1923,6 +2172,7 @@ Respond ONLY with valid JSON, no markdown fences:
                   <span key={m} style={{ ...S.chip(false), cursor: "default", fontSize: 12.5, color: T.sub }}>{m}</span>
                 ))}
               </div>
+              <ExPhoto name={modal.name} />
               <MuscleHighlightMap info={info} />
               <VideoButton name={modal.name} />
               {info.setup && (
@@ -2148,6 +2398,16 @@ Respond ONLY with valid JSON, no markdown fences:
   return (
     <div style={S.page}>
       <Header />
+      {(!online || queued > 0) && (
+        <div style={{
+          background: online ? T.goldDim : T.redDim, borderBottom: `1px solid ${T.line}`,
+          padding: "7px 14px", fontSize: 12.5, color: online ? T.gold : T.red, textAlign: "center",
+        }}>
+          {online
+            ? "Saved on this device — syncing…"
+            : "Offline — your sets are saved on this device and will sync when you reconnect"}
+        </div>
+      )}
       <div style={S.scroll}>
       <div style={S.shell}>
 
@@ -3104,6 +3364,42 @@ Respond ONLY with valid JSON, no markdown fences:
               )}
             </>)}
 
+            {statView === "strength" && e1rmList.length > 0 && (
+              <div style={S.card}>
+                <Rule label="Estimated 1RM" right="Epley" />
+                {(() => {
+                  const series = e1rmSeriesFor(chosenEx);
+                  const best = e1rmBest[(chosenEx || "").toLowerCase()];
+                  const delta = series.length > 1 ? series[series.length - 1].y - series[0].y : null;
+                  return (
+                    <>
+                      <div style={{ fontSize: 12.5, color: T.sub, marginBottom: 8 }}>{chosenEx}</div>
+                      {series.length > 1 ? (
+                        <LineChart series={[{ color: T.gold, points: series }]} height={110} area
+                          yFmt={(v) => v + "kg"}
+                          xLabels={series.map((p, i) => (i === 0 || i === series.length - 1 ? p.date.slice(5) : ""))} />
+                      ) : (
+                        <div style={{ fontSize: 13, color: T.sub, padding: "8px 0" }}>
+                          Log this lift a few more times to see the trend.
+                        </div>
+                      )}
+                      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 8, fontSize: 13 }}>
+                        {best && <span style={{ color: T.sub }}>Best e1RM <b style={{ ...mono, color: T.gold }}>{best.value} kg</b></span>}
+                        {delta !== null && (
+                          <span style={{ color: T.sub }}>
+                            Since first logged <b style={{ ...mono, color: delta >= 0 ? T.good : T.red }}>{delta >= 0 ? "+" : ""}{delta} kg</b>
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8, lineHeight: 1.5 }}>
+                        Estimated one-rep max from every set, so heavier reps at lower weight still count as progress. A flat line here while volume climbs means you are training, not gaining.
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+
             {/* progression */}
             {statView === "strength" && (<>
             {exNames.length > 0 && (
@@ -3375,12 +3671,16 @@ Respond ONLY with valid JSON, no markdown fences:
             {statView === "strength" && (<>
             {prList.length > 0 && (
               <div style={S.card}>
-                <Rule label="Personal records" />
+                <Rule label="Personal records" right="top set / e1RM" />
                 {prList.slice(0, 8).map((p) => (
                   <div key={p.name} onClick={() => openExercise(p.name)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: `1px solid ${T.line}`, cursor: "pointer" }}>
                     <ExIcon name={p.name} size={30} color={T.gold} />
                     <span style={{ flex: 1, fontSize: 14 }}>{p.name}</span>
-                    <span style={{ ...mono, color: T.gold, fontSize: 14 }}>{p.weight}<span style={{ color: T.dim, fontSize: 11 }}> kg</span></span>
+                    <span style={{ ...mono, color: T.gold, fontSize: 14 }}>{p.weight}<span style={{ color: T.dim, fontSize: 11 }}> kg</span>
+                      {e1rmBest[p.name.toLowerCase()] && (
+                        <span style={{ color: T.dim, fontSize: 11 }}> · {e1rmBest[p.name.toLowerCase()].value} e1RM</span>
+                      )}
+                    </span>
                     <span style={{ color: T.sub, fontSize: 12 }}>{p.date}</span>
                   </div>
                 ))}
