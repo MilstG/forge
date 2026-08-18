@@ -27,11 +27,6 @@ const writeJson = (f, data) => {
 const PASSWORD = process.env.APP_PASSWORD || "";
 app.use("/api", (req, res, next) => {
   if (req.path === "/whoop/callback") return next(); // OAuth redirect from WHOOP
-  if (req.path === "/whoop/auth") {
-    // browser navigation can't send headers; check token via query param
-    if (PASSWORD && req.query.token !== PASSWORD) return res.status(401).send("unauthorized");
-    return next();
-  }
   if (PASSWORD && req.headers["x-app-token"] !== PASSWORD) {
     return res.status(401).json({ error: "unauthorized" });
   }
@@ -47,22 +42,47 @@ const whoopConfigured = () => !!(process.env.WHOOP_CLIENT_ID && process.env.WHOO
 const appUrl = (req) => (process.env.APP_URL || `https://${req.headers.host}`).replace(/\/$/, "");
 let whoopCache = { at: 0, data: null };
 
-app.get("/api/whoop/auth", (req, res) => {
-  if (!whoopConfigured()) return res.status(500).send("Set WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET on the server first.");
+/* Header-authenticated: returns the WHOOP authorize URL for the app to
+   navigate to. Keeps the app password out of URLs entirely. */
+app.post("/api/whoop/auth-url", (req, res) => {
+  if (!whoopConfigured()) {
+    return res.status(400).json({ error: "WHOOP_CLIENT_ID / WHOOP_CLIENT_SECRET are not set on the server." });
+  }
   const state = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-  writeJson("whoop-state.json", { state });
+  writeJson("whoop-state.json", { state, at: Date.now() });
   const u = new URL(WHOOP_HOST + "/oauth/oauth2/auth");
   u.searchParams.set("client_id", process.env.WHOOP_CLIENT_ID);
   u.searchParams.set("redirect_uri", appUrl(req) + "/api/whoop/callback");
   u.searchParams.set("response_type", "code");
   u.searchParams.set("scope", "offline read:recovery read:sleep read:cycles read:profile");
   u.searchParams.set("state", state);
-  res.redirect(u.toString());
+  res.json({ url: u.toString(), redirect_uri: appUrl(req) + "/api/whoop/callback" });
+});
+
+/* Diagnostics: shows what the server thinks its config is, without
+   revealing secrets. Useful for checking the redirect URL matches. */
+app.get("/api/whoop/diag", (req, res) => {
+  const t = readJson("whoop.json", null);
+  res.json({
+    client_id_set: !!process.env.WHOOP_CLIENT_ID,
+    client_secret_set: !!process.env.WHOOP_CLIENT_SECRET,
+    app_url_env: process.env.APP_URL || null,
+    redirect_uri_used: appUrl(req) + "/api/whoop/callback",
+    connected: !!(t && t.access_token),
+    token_expires_in_min: t && t.expires_at ? Math.round((t.expires_at - Date.now()) / 60000) : null,
+    timezone: process.env.TIMEZONE || "UTC (set TIMEZONE)",
+    auto_adjust: (process.env.AUTO_ADJUST || "on"),
+  });
 });
 
 app.get("/api/whoop/callback", async (req, res) => {
   const saved = readJson("whoop-state.json", {});
-  if (!req.query.code || req.query.state !== saved.state) return res.status(400).send("OAuth state mismatch — try connecting again.");
+  if (req.query.error) {
+    return res.status(400).send(`WHOOP declined the request: ${req.query.error}. ${req.query.error_description || ""}`);
+  }
+  if (!req.query.code || req.query.state !== saved.state) {
+    return res.status(400).send("OAuth state mismatch — go back to the app and tap Connect WHOOP again.");
+  }
   try {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
@@ -77,7 +97,11 @@ app.get("/api/whoop/callback", async (req, res) => {
       body,
     });
     const tok = await r.json();
-    if (!r.ok) return res.status(502).send("Token exchange failed: " + JSON.stringify(tok));
+    if (!r.ok) return res.status(502).send(
+      "Token exchange failed. This almost always means the Redirect URL in your WHOOP app " +
+      "doesn't exactly match:\n\n  " + appUrl(req) + "/api/whoop/callback\n\n" +
+      "Check it character-for-character in the WHOOP Developer Dashboard, then try again.\n\nWHOOP said: " + JSON.stringify(tok)
+    );
     writeJson("whoop.json", {
       access_token: tok.access_token,
       refresh_token: tok.refresh_token,
