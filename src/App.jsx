@@ -800,10 +800,14 @@ export default function Forge() {
     } catch (e) {}
   };
 
+  /* Tick only while a session or rest timer is running: this used to re-render
+     the whole app twice a second, which remounted open modals and reset scroll. */
   useEffect(() => {
+    if (!live && !restEnd) return undefined;
+    setNowTs(Date.now());
     const id = setInterval(() => setNowTs(Date.now()), 500);
     return () => clearInterval(id);
-  }, []);
+  }, [live, restEnd]);
 
   /* Keep the screen awake during a live session — phones lock mid-set otherwise. */
   useEffect(() => {
@@ -3797,7 +3801,7 @@ Respond ONLY with valid JSON, no markdown fences:
       </div>
       </div>
       <Tabs />
-      <ExModal />
+      {ExModal()}
       {celebrate && (
         <div onClick={() => setCelebrate(null)} style={{
           position: "absolute", inset: 0, zIndex: 60, background: "rgba(6,8,11,0.88)",
