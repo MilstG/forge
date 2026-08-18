@@ -132,6 +132,309 @@ const groupFor = (name) => {
   return "Other";
 };
 
+/* ================= muscle readiness body map ================= */
+/* ---------- 1 · Readiness model ----------
+   Each logged set adds fatigue to its muscle group, decaying with a
+   ~38 h half-life. Soreness reported in a check-in within the last
+   2 days bumps a "ready" group to "recovering". Groups never trained
+   in your log show as "untracked" (dim). */
+const READY_GROUPS = ["Shoulders", "Chest", "Back", "Arms", "Core", "Legs", "Hamstrings", "Glutes"];
+const HALF_LIFE_H = 38;
+
+const muscleReadiness = (workouts, checkins, todayStr) => {
+  const now = new Date(todayStr + "T12:00:00");
+  const acc = {};
+  READY_GROUPS.forEach((g) => { acc[g] = { load: 0, sets7: 0, last: null }; });
+  (workouts || []).forEach((w) => {
+    const days = (now - new Date(w.date + "T12:00:00")) / 864e5;
+    (w.exercises || []).forEach((e) => {
+      const g = groupFor(e.name);
+      if (!acc[g]) return;
+      if (!acc[g].last || w.date > acc[g].last) acc[g].last = w.date;
+      if (days < 0 || days > 7) return;
+      acc[g].sets7 += +e.sets || 1;
+      if (days <= 6) acc[g].load += (+e.sets || 1) * Math.pow(0.5, (days * 24) / HALF_LIFE_H);
+    });
+  });
+  const sore = new Set();
+  (checkins || []).forEach((c) => {
+    const days = (now - new Date(c.date + "T12:00:00")) / 864e5;
+    const list = c.sore || c.soreness || [];
+    if (days >= 0 && days <= 2 && Array.isArray(list)) list.forEach((g) => sore.add(g));
+  });
+  const out = {};
+  READY_GROUPS.forEach((g) => {
+    const { load, sets7, last } = acc[g];
+    let status = !last ? "untracked" : load >= 5 ? "fatigued" : load >= 1.8 ? "recovering" : "ready";
+    if (sore.has(g) && status === "ready") status = "recovering";
+    out[g] = { status, load: Math.round(load * 10) / 10, sets7, last };
+  });
+  return out;
+};
+
+const STATUS_COLOR = { fatigued: T.red, recovering: T.gold, ready: T.good };
+const STATUS_LABEL = { fatigued: "Fatigued", recovering: "Recovering", ready: "Ready", untracked: "No data yet" };
+
+/* ---------- 2 · Body map (front + back, tappable) ----------
+   Regions are data, drawn as the right half and mirrored, so both
+   sides stay symmetric and share tap behaviour. */
+const BODY_BASE = [
+  "M60,30 C68,29 75,31 78,34 C81,37 81,43 81,50 C81,62 79,76 77,86 C76,94 72,99 60,100 Z",
+  "M60,88 L74,88 C76,96 74,106 60,109 Z",
+  "M79,36 C86,33 91,38 92,46 C93,56 92,66 90,73 C88,77 85,77 84,73 C82,66 80,50 79,36 Z",
+  "M84,75 C88,74 92,78 93,85 C94,93 95,100 96,106 C97,111 94,114 92,113 C89,111 88,104 87,97 C86,90 84,82 84,75 Z",
+  "M60,100 C70,99 77,104 78,114 C79,128 77,143 73,153 C70,158 64,158 62,153 C60,144 60,118 60,100 Z",
+  "M62,155 C68,153 73,157 73,167 C73,179 71,191 69,197 C67,200 63,200 62,197 C61,188 61,168 62,155 Z",
+  "M61,197 L70,197 L73,203 L61,203 Z",
+];
+const BODY_MUSCLES = {
+  front: [
+    ["Shoulders", "M79,33 C85,32 90,37 90,44 C90,49 87,51 83,49 C80,46 78,39 79,33 Z"],
+    ["Chest", "M61.5,37 C69,36.5 76,40 77.5,46 C78,52 73,57 66,56.5 C62.5,56 61.5,54 61.5,50 Z"],
+    ["Arms", "M83,51 C87,51 90,55 90.5,61 C91,67 89,72 86.5,72 C84,72 83,67 82.5,61 C82.5,56 82.5,52 83,51 Z"],
+    ["Arms", "M86,75 C90,75 92,80 93,87 C94,93 94,98 92,99 C89.5,100 88,95 87,88 C86.5,83 86,78 86,75 Z"],
+    ["Core", "M61,59 L68,59 C69,59 69.5,60 69.5,62 L69.5,90 C69.5,94 66,96 61,96 Z"],
+    ["Core", "M71,61 C73.5,61 75,64 75,70 C75,78 73.5,85 71.5,88 C70,86 70,66 71,61 Z"],
+    ["Legs", "M63,103 C70,101 76,106 77,114 C78,126 76,140 72,149 C69,153 64,153 62.5,148 C61,140 61.5,112 63,103 Z"],
+    ["Legs", "M64.5,157 C69,156 71.5,161 71.5,169 C71.5,179 69.5,188 67.5,191 C65.5,189 64,179 63.5,169 C63.5,163 63.5,158 64.5,157 Z"],
+  ],
+  back: [
+    ["Back", "M60,27 C65,28 70,30 73,33 C68,39 63,45 60,51 Z"],
+    ["Shoulders", "M79,33 C85,32 90,37 90,44 C90,49 87,51 83,49 C80,46 78,39 79,33 Z"],
+    ["Back", "M61.5,50 C68,48 75,46 78,48 C77,58 73,68 67,76 C63.5,79 61.5,78 61.5,72 Z"],
+    ["Back", "M61,58 C63,58 64,59 64,61 L64,88 C64,91 62.5,92 61,92 Z"],
+    ["Arms", "M83,51 C87,51 90,55 90.5,61 C91,67 89,72 86.5,72 C84,72 83,67 82.5,61 C82.5,56 82.5,52 83,51 Z"],
+    ["Arms", "M86,75 C90,75 92,80 93,87 C94,93 94,98 92,99 C89.5,100 88,95 87,88 C86.5,83 86,78 86,75 Z"],
+    ["Glutes", "M61.5,92 C69,90 75,94 76,101 C77,108 71,113 66,113 C62.5,113 61.5,109 61.5,103 Z"],
+    ["Hamstrings", "M63,116 C70,114 76,118 76.5,127 C77,138 74,148 70,153 C66,155 63.5,151 62.5,143 C61.5,133 62,122 63,116 Z"],
+    ["Legs", "M64,157 C69.5,156 72.5,162 72.5,171 C72.5,181 70,189 67.5,191 C65,189 63,180 63,170 C63,163 63,158 64,157 Z"],
+  ],
+};
+const BODY_LINES = {
+  front: [
+    "M53,67 L67,67", "M53,74 L67,74", "M53,81 L67,81", "M60,60 L60,95",
+    "M70,106 C72,116 72,132 69,146",
+  ],
+  back: ["M69,118 C70,128 69.5,140 67,150", "M67.5,159 C68.5,168 68,180 66.5,188"],
+};
+
+const BodyFigure = ({ side, fills, height, selected, onSelect }) => {
+  const base = T.raised;
+  const half = (
+    <>
+      {BODY_BASE.map((d, i) => <path key={"b" + i} d={d} fill={base} />)}
+      {BODY_MUSCLES[side].map(([g, d], i) => (
+        <path key={"m" + i} d={d} fill={fills[g] || base}
+          opacity={selected && selected !== g ? 0.35 : 1}
+          stroke={selected === g ? T.text : "none"} strokeWidth="1"
+          style={{ cursor: onSelect ? "pointer" : "default", transition: "opacity 0.15s" }}
+          onClick={onSelect ? (ev) => { ev.stopPropagation(); onSelect(g); } : undefined} />
+      ))}
+      <g stroke={base} strokeWidth="1.1" fill="none" opacity="0.9" pointerEvents="none">
+        {BODY_LINES[side].map((d, i) => <path key={"l" + i} d={d} />)}
+      </g>
+    </>
+  );
+  return (
+    <svg viewBox="0 0 120 210" height={height} style={{ display: "block" }}>
+      <ellipse cx="60" cy="13" rx="8.5" ry="10" fill={base} />
+      <path d="M54,21 L66,21 L68,30 L52,30 Z" fill={base} />
+      <g>{half}</g>
+      <g transform="translate(120,0) scale(-1,1)">{half}</g>
+    </svg>
+  );
+};
+
+const BodyMap = ({ fills = {}, height = 230, selected, onSelect }) => (
+  <div style={{ display: "flex", gap: 22, justifyContent: "center", padding: "6px 0 2px" }}>
+    {["front", "back"].map((s) => (
+      <div key={s} style={{ textAlign: "center" }}>
+        <BodyFigure side={s} fills={fills} height={height} selected={selected} onSelect={onSelect} />
+        <div style={{ fontSize: 10, color: T.dim, marginTop: 4, fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.12em" }}>{s}</div>
+      </div>
+    ))}
+  </div>
+);
+
+/* ---------- 3 · Readiness card (tap a muscle for its numbers) ---------- */
+const ReadinessCard = ({ workouts, checkins, todayStr }) => {
+  const [sel, setSel] = useState(null);
+  const r = muscleReadiness(workouts, checkins, todayStr);
+  const fills = {};
+  Object.entries(r).forEach(([g, v]) => {
+    if (v.status !== "untracked") fills[g] = STATUS_COLOR[v.status];
+  });
+  const counts = { fatigued: 0, recovering: 0, ready: 0 };
+  Object.values(r).forEach((v) => { if (counts[v.status] !== undefined) counts[v.status]++; });
+  const d = sel ? r[sel] : null;
+  return (
+    <div onClick={() => setSel(null)} style={{
+      background: T.surface, border: `1px solid ${T.line}`, borderRadius: 14,
+      padding: 16, marginBottom: 12,
+    }}>
+      <div style={{
+        fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.1em",
+        fontWeight: 700, fontSize: 12, color: T.sub, marginBottom: 4,
+      }}>
+        Muscle readiness
+      </div>
+      <BodyMap fills={fills} selected={sel} onSelect={(g) => setSel(sel === g ? null : g)} />
+      <div style={{ display: "flex", justifyContent: "center", gap: 16, marginTop: 8 }}>
+        {[["fatigued", "Fatigued"], ["recovering", "Recovering"], ["ready", "Ready"]].map(([k, l]) => (
+          <span key={k} style={{ fontSize: 11.5, color: T.sub, display: "inline-flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: STATUS_COLOR[k], display: "inline-block" }} />
+            {l} <span style={{ fontFamily: FM, color: T.dim }}>{counts[k]}</span>
+          </span>
+        ))}
+      </div>
+      {d ? (
+        <div onClick={(ev) => ev.stopPropagation()} style={{
+          marginTop: 12, background: T.surface2, border: `1px solid ${T.line}`,
+          borderLeft: `2px solid ${STATUS_COLOR[d.status] || T.dim}`,
+          borderRadius: 10, padding: "10px 12px",
+          display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap",
+        }}>
+          <span style={{ fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, fontSize: 15 }}>{sel}</span>
+          <span style={{ fontSize: 12.5, color: STATUS_COLOR[d.status] || T.sub, fontWeight: 700 }}>{STATUS_LABEL[d.status]}</span>
+          <span style={{ fontFamily: FM, fontSize: 12, color: T.sub, marginLeft: "auto" }}>
+            load {d.load} · {d.sets7} sets / 7d{d.last ? ` · last ${d.last.slice(5)}` : ""}
+          </span>
+        </div>
+      ) : (
+        <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8, lineHeight: 1.5, textAlign: "center" }}>
+          Estimated from your last 6 days of sets. Tap any muscle for its numbers.
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ---------- 4 · Muscle highlight for the form-guide modal ---------- */
+const regionForMuscle = (m) => {
+  const n = (m || "").toLowerCase();
+  if (/pec|chest/.test(n)) return "Chest";
+  if (/lat|trap|rhomboid|erector|lower back|upper back|back/.test(n)) return "Back";
+  if (/delt|shoulder|rotator/.test(n)) return "Shoulders";
+  if (/bicep|tricep|forearm|brachi|arm|grip/.test(n)) return "Arms";
+  if (/glute/.test(n)) return "Glutes";
+  if (/hamstring/.test(n)) return "Hamstrings";
+  if (/quad|calf|calves|adductor|leg|tibialis|soleus/.test(n)) return "Legs";
+  if (/ab|core|oblique|hip flexor|spinae/.test(n)) return "Core";
+  return null;
+};
+
+const MuscleHighlightMap = ({ info }) => {
+  if (!info) return null;
+  const fills = {};
+  (info.muscles_secondary || []).forEach((m) => {
+    const g = regionForMuscle(m); if (g) fills[g] = T.blue;
+  });
+  (info.muscles_primary || []).forEach((m) => {
+    const g = regionForMuscle(m); if (g) fills[g] = T.accent;
+  });
+  if (!Object.keys(fills).length) return null;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <BodyMap fills={fills} height={160} />
+      <div style={{ display: "flex", justifyContent: "center", gap: 16, marginTop: 2, fontSize: 11.5, color: T.sub }}>
+        <span><span style={{ color: T.accent }}>■</span> Primary</span>
+        <span><span style={{ color: T.blue }}>■</span> Secondary</span>
+      </div>
+    </div>
+  );
+};
+
+/* ---------- 5 · Video button (opens a YouTube form search) ---------- */
+const VideoButton = ({ name }) => (
+  <button
+    onClick={() => window.open(
+      "https://www.youtube.com/results?search_query=" +
+      encodeURIComponent((name || "") + " exercise proper form"), "_blank")}
+    style={{
+      width: "100%", padding: "11px 12px", marginBottom: 14, cursor: "pointer",
+      background: T.surface2, border: `1px solid ${T.line}`, borderRadius: 10,
+      color: T.blue, fontWeight: 700, fontSize: 13.5, fontFamily: FB,
+    }}>
+    ▶ Watch form videos on YouTube
+  </button>
+);
+
+/* ---------- 6 · Animated exercise demo ----------
+   Two-pose loop (SMIL crossfade) for the main movement patterns.
+   Falls back to the static pictogram for anything unmatched. */
+const DemoSvg = ({ size, a, b }) => (
+  <svg viewBox="0 0 64 64" width={size} height={size} fill="none"
+    stroke={T.accent} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+    <g>
+      {a}
+      <animate attributeName="opacity" values="1;1;0;0;1" keyTimes="0;0.42;0.5;0.92;1" dur="1.8s" repeatCount="indefinite" />
+    </g>
+    <g opacity="0">
+      {b}
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.42;0.5;0.92;1" dur="1.8s" repeatCount="indefinite" />
+    </g>
+  </svg>
+);
+
+const DEMOS = {
+  squat: {
+    a: (<><circle cx="32" cy="10" r="5" /><path d="M32 15v16" /><path d="M14 21h36" /><circle cx="15" cy="21" r="3" /><circle cx="49" cy="21" r="3" /><path d="M32 31l-6 12v12M32 31l6 12v12" /></>),
+    b: (<><circle cx="32" cy="22" r="5" /><path d="M32 27v9" /><path d="M14 33h36" /><circle cx="15" cy="33" r="3" /><circle cx="49" cy="33" r="3" /><path d="M32 36l-11 5 4 14M32 36l11 5-4 14" /></>),
+  },
+  hinge: {
+    a: (<><circle cx="22" cy="17" r="5" /><path d="M24 21l12 12" /><path d="M36 33v14" /><path d="M25 25c-4 8-3 16 1 22" /><path d="M28 52h16" /><circle cx="28" cy="52" r="3" /><circle cx="44" cy="52" r="3" /></>),
+    b: (<><circle cx="32" cy="10" r="5" /><path d="M32 15v18" /><path d="M32 33l-5 10v9M32 33l5 10v9" /><path d="M24 30h16" /><circle cx="24" cy="30" r="3" /><circle cx="40" cy="30" r="3" /></>),
+  },
+  pressH: {
+    a: (<><path d="M12 44h40" /><circle cx="20" cy="38" r="5" /><path d="M25 40h20" /><path d="M34 40v-8" /><path d="M22 32h24" /><circle cx="23" cy="32" r="3" /><circle cx="45" cy="32" r="3" /></>),
+    b: (<><path d="M12 44h40" /><circle cx="20" cy="38" r="5" /><path d="M25 40h20" /><path d="M34 40v-20" /><path d="M22 20h24" /><circle cx="23" cy="20" r="3" /><circle cx="45" cy="20" r="3" /></>),
+  },
+  pressV: {
+    a: (<><circle cx="32" cy="14" r="5" /><path d="M32 19v16" /><path d="M32 35l-6 14M32 35l6 14" /><path d="M20 24h24" /><circle cx="20" cy="24" r="3" /><circle cx="44" cy="24" r="3" /></>),
+    b: (<><circle cx="32" cy="20" r="5" /><path d="M32 25v12" /><path d="M32 37l-6 12M32 37l6 12" /><path d="M20 8h24" /><circle cx="20" cy="8" r="3" /><circle cx="44" cy="8" r="3" /></>),
+  },
+  pullup: {
+    a: (<><path d="M12 10h40" /><circle cx="32" cy="26" r="5" /><path d="M24 12l8 9M40 12l-8 9" /><path d="M32 31v14l-4 8M32 45l4 8" /></>),
+    b: (<><path d="M12 10h40" /><circle cx="32" cy="15" r="5" /><path d="M24 12l4 4M40 12l-4 4" /><path d="M32 20v14l-4 8M32 34l4 8" /></>),
+  },
+  row: {
+    a: (<><circle cx="20" cy="16" r="5" /><path d="M23 20l14 8" /><path d="M37 28v14M37 42l6 8M37 42l-2 10" /><path d="M28 28v12" /><path d="M22 40h12" /><circle cx="22" cy="40" r="3" /><circle cx="34" cy="40" r="3" /></>),
+    b: (<><circle cx="20" cy="16" r="5" /><path d="M23 20l14 8" /><path d="M37 28v14M37 42l6 8M37 42l-2 10" /><path d="M28 28v4" /><path d="M22 32h12" /><circle cx="22" cy="32" r="3" /><circle cx="34" cy="32" r="3" /></>),
+  },
+  curl: {
+    a: (<><circle cx="32" cy="12" r="5" /><path d="M32 17v20" /><path d="M32 37l-5 14M32 37l5 14" /><path d="M32 22l-8 6v10M32 22l8 6v10" /><circle cx="24" cy="40" r="3" /><circle cx="40" cy="40" r="3" /></>),
+    b: (<><circle cx="32" cy="12" r="5" /><path d="M32 17v20" /><path d="M32 37l-5 14M32 37l5 14" /><path d="M32 22l-8 6 2-8M32 22l8 6-2-8" /><circle cx="26" cy="19" r="3" /><circle cx="38" cy="19" r="3" /></>),
+  },
+  lunge: {
+    a: (<><circle cx="32" cy="10" r="5" /><path d="M32 15v18" /><path d="M32 33l-5 10v9M32 33l5 10v9" /></>),
+    b: (<><circle cx="30" cy="14" r="5" /><path d="M30 19v14" /><path d="M30 33l-10 6v11M30 33l9 4 5 13" /></>),
+  },
+  pushup: {
+    a: (<><circle cx="16" cy="26" r="5" /><path d="M21 29l26 8" /><path d="M20 32v10M44 40v10" /></>),
+    b: (<><circle cx="14" cy="38" r="5" /><path d="M19 40l28 4" /><path d="M18 42l2 8M44 44v6" /></>),
+  },
+};
+
+const demoFor = (name) => {
+  const n = (name || "").toLowerCase();
+  if (/squat|leg press/.test(n)) return DEMOS.squat;
+  if (/deadlift|rdl|romanian|hinge|swing|good ?morning|thrust/.test(n)) return DEMOS.hinge;
+  if (/push-?up/.test(n)) return DEMOS.pushup;
+  if (/bench|chest press|fly/.test(n)) return DEMOS.pressH;
+  if (/overhead|shoulder press|ohp|military/.test(n)) return DEMOS.pressV;
+  if (/pull-?up|chin|pulldown/.test(n)) return DEMOS.pullup;
+  if (/row/.test(n)) return DEMOS.row;
+  if (/curl/.test(n)) return DEMOS.curl;
+  if (/lunge|split/.test(n)) return DEMOS.lunge;
+  return null;
+};
+
+const ExDemo = ({ name, size = 64, fallback = null }) => {
+  const d = demoFor(name);
+  if (!d) return fallback;
+  return <DemoSvg size={size} a={d.a} b={d.b} />;
+};
+
 const GOALS = ["Build strength", "Build muscle", "Lose fat", "Endurance", "General fitness"];
 const LEVELS = ["Beginner", "Intermediate", "Advanced"];
 const GEAR = [
@@ -1594,7 +1897,8 @@ Respond ONLY with valid JSON, no markdown fences:
           border: `1px solid ${T.line}`, boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
         }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
-            <ExIcon name={modal.name} size={52} color={T.accent} />
+            <ExDemo name={modal.name} size={56}
+              fallback={<ExIcon name={modal.name} size={52} color={T.accent} />} />
             <div style={{ flex: 1 }}>
               <div style={{ ...display, fontSize: 25 }}>{modal.name}</div>
               <div style={{ fontSize: 12.5, color: T.sub }}>{groupFor(modal.name)}</div>
@@ -1619,6 +1923,8 @@ Respond ONLY with valid JSON, no markdown fences:
                   <span key={m} style={{ ...S.chip(false), cursor: "default", fontSize: 12.5, color: T.sub }}>{m}</span>
                 ))}
               </div>
+              <MuscleHighlightMap info={info} />
+              <VideoButton name={modal.name} />
               {info.setup && (
                 <div style={{ marginBottom: 12 }}>
                   <div style={S.label}>Setup</div>
@@ -2588,6 +2894,10 @@ Respond ONLY with valid JSON, no markdown fences:
             </div>
 
             </>)}
+
+            {statView === "muscle" && (
+              <ReadinessCard workouts={workouts} checkins={checkins} todayStr={todayStr} />
+            )}
 
             {statView === "muscle" && muscleTrend.length > 0 && (
               <div style={S.card}>
