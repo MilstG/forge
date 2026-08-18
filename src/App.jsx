@@ -689,6 +689,11 @@ export default function Forge() {
     return round1(+pts[pts.length - 1][k] - +pts[0][k]);
   };
 
+  const hasStrengthData = liftHistory.length > 0 || RATIOS.length > 0 || relStrength.length > 0
+    || rpeEntries.length > 0 || exStats.length > 0;
+  const hasMuscleData = muscleTrend.length > 0 || mList.length > 0 || sorenessCount.length > 0;
+  const weightedSets = workouts.reduce((a, w) => a + w.exercises.filter((e) => +e.weight > 0).length, 0);
+
   /* ----- progression memory ----- */
   const lastPerfFor = (name) => {
     const k = (name || "").trim().toLowerCase();
@@ -1467,6 +1472,19 @@ Respond ONLY with valid JSON, no markdown fences:
         <span>today</span>
       </div>
     </>
+  );
+
+  const Empty = ({ label, title, lines }) => (
+    <div style={S.card}>
+      <Rule label={label} />
+      <div style={{ ...display, fontSize: 19, marginBottom: 8, color: T.sub }}>{title}</div>
+      {lines.map((l, i) => (
+        <div key={i} style={{ display: "flex", gap: 9, fontSize: 13, color: T.sub, lineHeight: 1.55, marginBottom: 6 }}>
+          <span style={{ color: T.accent, ...mono, fontSize: 11, paddingTop: 2 }}>{String(i + 1).padStart(2, "0")}</span>
+          <span>{l}</span>
+        </div>
+      ))}
+    </div>
   );
 
   const Ring = ({ pct, size = 46 }) => {
