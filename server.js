@@ -471,14 +471,15 @@ Rules:
 - Keep the same day name and a similar exercise count. Use ONLY the available equipment.
 
 Respond ONLY with valid JSON, no markdown fences:
-{"day":"${dy.day}","rest":false,"focus":"session title","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
+{"day":"${dy.day}","rest":false,"focus":"session title","warmup":"one line warm-up for this session","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
 
     const text = await callAI(prompt, 1200);
     const adj = JSON.parse(text.replace(/```json|```/g, "").trim());
     data.plan.originalDay = { idx, day: dy };
     data.plan.week[idx] = {
       day: adj.day || dy.day, rest: false,
-      focus: adj.focus || dy.focus, exercises: adj.exercises || dy.exercises,
+      focus: adj.focus || dy.focus, warmup: adj.warmup || dy.warmup,
+      exercises: adj.exercises || dy.exercises,
     };
     data.plan.adjustedDate = today;
     data.plan.adjustNote = adj.adjust_note || "Adjusted to today's recovery.";
