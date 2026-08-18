@@ -1418,7 +1418,28 @@ export default function Forge() {
     window.addEventListener("offline", down);
     if (navigator.onLine) flushPending();
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
+      /* Register, then actively look for a newer build. Without this a cached
+         worker can keep serving an old bundle and deploys look like no-ops. */
+      navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then((reg) => {
+        reg.update().catch(() => {});
+        setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+        reg.addEventListener("updatefound", () => {
+          const sw = reg.installing;
+          if (!sw) return;
+          sw.addEventListener("statechange", () => {
+            /* a new worker took over an existing page: reload once to run it */
+            if (sw.state === "installed" && navigator.serviceWorker.controller) {
+              sw.postMessage("skip-waiting");
+            }
+          });
+        });
+      }).catch(() => {});
+      let reloaded = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (reloaded) return;
+        reloaded = true;
+        window.location.reload();
+      });
     }
     // eslint-disable-next-line
   }, []);
