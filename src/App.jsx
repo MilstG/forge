@@ -95,6 +95,11 @@ const LIB = [
   { name: "Crunch", group: "Core", icon: "plank", gear: [] },
   { name: "Run", group: "Cardio", icon: "run", gear: [] },
   { name: "Bike", group: "Cardio", icon: "run", gear: ["cardio"] },
+  { name: "Walk", group: "Cardio", icon: "run", gear: [] },
+  { name: "Rowing machine", group: "Cardio", icon: "run", gear: ["cardio"] },
+  { name: "Elliptical", group: "Cardio", icon: "run", gear: ["cardio"] },
+  { name: "Jump rope", group: "Cardio", icon: "run", gear: [] },
+  { name: "Swim", group: "Cardio", icon: "run", gear: [] },
 ];
 
 const iconFor = (name) => {
@@ -117,7 +122,11 @@ const iconFor = (name) => {
   return ICONS.raise;
 };
 const groupFor = (name) => {
-  const n = (name || "").toLowerCase();
+  const n = (name || "").trim().toLowerCase();
+  const exact = LIB.find((e) => e.name.toLowerCase() === n);
+  if (exact) return exact.group;
+  // guarded before the fuzzy pass: "Walking lunge" must not match the "Walk" entry
+  if (/lunge|split squat/.test(n)) return "Legs";
   const hit = LIB.find((e) => n.includes(e.name.toLowerCase()) || e.name.toLowerCase().includes(n));
   if (hit) return hit.group;
   if (/squat|leg|lunge|calf/.test(n)) return "Legs";
@@ -130,6 +139,33 @@ const groupFor = (name) => {
   if (/plank|crunch|core|ab/.test(n)) return "Core";
   if (/run|bike|cardio|sprint|walk/.test(n)) return "Cardio";
   return "Other";
+};
+
+/* ================= time-based movements =================
+   Cardio, holds and carries can't be logged as sets × reps × kg —
+   the honest unit is minutes (plus distance where it exists). An
+   exercise carries an explicit `mode` once the user toggles it;
+   otherwise the mode is inferred from the name. Entries logged
+   before this existed have no mode and no mins, so they read as
+   "reps" and behave exactly as they always did. */
+const TIMED_RE = /\b(run|running|jog|jogging|sprint|sprints|bike|biking|cycling|spin|walk|walking|hike|hiking|treadmill|elliptical|erg|rower|rowing machine|stairmaster|stair climber|swim|swimming|jump rope|skipping|cardio|plank|dead hang|wall sit|carry|farmers walk)\b/i;
+const isTimedName = (name) => {
+  const n = String(name || "").replace(/[-_']/g, " ");
+  if (/lunge/i.test(n)) return false;
+  return TIMED_RE.test(n);
+};
+const exMode = (ex) => (ex && ex.mode) || (isTimedName(ex && ex.name) ? "time" : "reps");
+const isTimedEx = (ex) => exMode(ex) === "time";
+// one-line summary for history, plan rows and "last time" hints
+const exSummary = (e) => {
+  if (!e) return "";
+  if (isTimedEx(e)) {
+    const bits = [];
+    if (e.mins) bits.push(`${e.mins} min`);
+    if (e.km) bits.push(`${e.km} km`);
+    return bits.join(" · ");
+  }
+  return `${e.sets ? `${e.sets}×` : ""}${e.reps || ""}${e.weight ? ` @ ${e.weight}kg` : ""}`;
 };
 
 /* ================= exercise name normalization =================
@@ -211,6 +247,10 @@ const ALIASES = {
   "rowing machine": ["rower", "erg", "row machine", "concept2"],
   "jump rope": ["skipping", "skip rope"],
   "elliptical": ["cross trainer"],
+  "walk": ["walking", "brisk walk", "hike", "hiking", "walking, treadmill"],
+  "swim": ["swimming", "swim laps", "laps"],
+  "stair climber": ["stairmaster", "stair master", "step mill", "stairs"],
+  "dead hang": ["hang", "bar hang"],
 };
 const ALIAS_LOOKUP = (() => {
   const m = {};
@@ -249,7 +289,7 @@ const estimate1RM = (weight, reps) => {
    photo; anything else goes through the fuzzy matcher below. Coverage is
    verified by a test rather than spot-checked. */
 const EX_NAMES = "3/4 Sit-Up|90/90 Hamstring|Ab Crunch Machine|Ab Roller|Adductor|Adductor/Groin|Advanced Kettlebell Windmill|Air Bike|All Fours Quad Stretch|Alternate Hammer Curl|Alternate Heel Touchers|Alternate Incline Dumbbell Curl|Alternate Leg Diagonal Bound|Alternating Cable Shoulder Press|Alternating Deltoid Raise|Alternating Floor Press|Alternating Hang Clean|Alternating Kettlebell Press|Alternating Kettlebell Row|Alternating Renegade Row|Ankle Circles|Ankle On The Knee|Anterior Tibialis-SMR|Anti-Gravity Press|Arm Circles|Arnold Dumbbell Press|Around The Worlds|Atlas Stone Trainer|Atlas Stones|Axle Deadlift|Back Flyes - With Bands|Backward Drag|Backward Medicine Ball Throw|Balance Board|Ball Leg Curl|Band Assisted Pull-Up|Band Good Morning|Band Good Morning (Pull Through)|Band Hip Adductions|Band Pull Apart|Band Skull Crusher|Barbell Ab Rollout|Barbell Ab Rollout - On Knees|Barbell Bench Press - Medium Grip|Barbell Curl|Barbell Curls Lying Against An Incline|Barbell Deadlift|Barbell Full Squat|Barbell Glute Bridge|Barbell Guillotine Bench Press|Barbell Hack Squat|Barbell Hip Thrust|Barbell Incline Bench Press - Medium Grip|Barbell Incline Shoulder Raise|Barbell Lunge|Barbell Rear Delt Row|Barbell Rollout from Bench|Barbell Seated Calf Raise|Barbell Shoulder Press|Barbell Shrug|Barbell Shrug Behind The Back|Barbell Side Bend|Barbell Side Split Squat|Barbell Squat|Barbell Squat To A Bench|Barbell Step Ups|Barbell Walking Lunge|Battling Ropes|Bear Crawl Sled Drags|Behind Head Chest Stretch|Bench Dips|Bench Jump|Bench Press - Powerlifting|Bench Press - With Bands|Bench Press with Chains|Bench Sprint|Bent Over Barbell Row|Bent Over Dumbbell Rear Delt Raise With Head On Bench|Bent Over Low-Pulley Side Lateral|Bent Over One-Arm Long Bar Row|Bent Over Two-Arm Long Bar Row|Bent Over Two-Dumbbell Row|Bent Over Two-Dumbbell Row With Palms In|Bent Press|Bent-Arm Barbell Pullover|Bent-Arm Dumbbell Pullover|Bent-Knee Hip Raise|Bicycling|Bicycling, Stationary|Board Press|Body Tricep Press|Body-Up|Bodyweight Flyes|Bodyweight Mid Row|Bodyweight Squat|Bodyweight Walking Lunge|Bosu Ball Cable Crunch With Side Bends|Bottoms Up|Bottoms-Up Clean From The Hang Position|Box Jump (Multiple Response)|Box Skip|Box Squat|Box Squat with Bands|Box Squat with Chains|Brachialis-SMR|Bradford/Rocky Presses|Butt Lift (Bridge)|Butt-Ups|Butterfly|Cable Chest Press|Cable Crossover|Cable Crunch|Cable Deadlifts|Cable Hammer Curls - Rope Attachment|Cable Hip Adduction|Cable Incline Pushdown|Cable Incline Triceps Extension|Cable Internal Rotation|Cable Iron Cross|Cable Judo Flip|Cable Lying Triceps Extension|Cable One Arm Tricep Extension|Cable Preacher Curl|Cable Rear Delt Fly|Cable Reverse Crunch|Cable Rope Overhead Triceps Extension|Cable Rope Rear-Delt Rows|Cable Russian Twists|Cable Seated Crunch|Cable Seated Lateral Raise|Cable Shoulder Press|Cable Shrugs|Cable Wrist Curl|Calf Press|Calf Press On The Leg Press Machine|Calf Raise On A Dumbbell|Calf Raises - With Bands|Calf Stretch Elbows Against Wall|Calf Stretch Hands Against Wall|Calf-Machine Shoulder Shrug|Calves-SMR|Car Deadlift|Car Drivers|Carioca Quick Step|Cat Stretch|Catch and Overhead Throw|Chain Handle Extension|Chain Press|Chair Leg Extended Stretch|Chair Lower Back Stretch|Chair Squat|Chair Upper Body Stretch|Chest And Front Of Shoulder Stretch|Chest Push (multiple response)|Chest Push (single response)|Chest Push from 3 point stance|Chest Push with Run Release|Chest Stretch on Stability Ball|Child's Pose|Chin To Chest Stretch|Chin-Up|Circus Bell|Clean|Clean Deadlift|Clean Pull|Clean Shrug|Clean and Jerk|Clean and Press|Clean from Blocks|Clock Push-Up|Close-Grip Barbell Bench Press|Close-Grip Dumbbell Press|Close-Grip EZ Bar Curl|Close-Grip EZ-Bar Curl with Band|Close-Grip EZ-Bar Press|Close-Grip Front Lat Pulldown|Close-Grip Push-Up off of a Dumbbell|Close-Grip Standing Barbell Curl|Cocoons|Conan's Wheel|Concentration Curls|Cross Body Hammer Curl|Cross Over - With Bands|Cross-Body Crunch|Crossover Reverse Lunge|Crucifix|Crunch - Hands Overhead|Crunch - Legs On Exercise Ball|Crunches|Cuban Press|Dancer's Stretch|Dead Bug|Deadlift with Bands|Deadlift with Chains|Decline Barbell Bench Press|Decline Close-Grip Bench To Skull Crusher|Decline Crunch|Decline Dumbbell Bench Press|Decline Dumbbell Flyes|Decline Dumbbell Triceps Extension|Decline EZ Bar Triceps Extension|Decline Oblique Crunch|Decline Push-Up|Decline Reverse Crunch|Decline Smith Press|Deficit Deadlift|Depth Jump Leap|Dip Machine|Dips - Chest Version|Dips - Triceps Version|Donkey Calf Raises|Double Kettlebell Alternating Hang Clean|Double Kettlebell Jerk|Double Kettlebell Push Press|Double Kettlebell Snatch|Double Kettlebell Windmill|Double Leg Butt Kick|Downward Facing Balance|Drag Curl|Drop Push|Dumbbell Alternate Bicep Curl|Dumbbell Bench Press|Dumbbell Bench Press with Neutral Grip|Dumbbell Bicep Curl|Dumbbell Clean|Dumbbell Floor Press|Dumbbell Flyes|Dumbbell Incline Row|Dumbbell Incline Shoulder Raise|Dumbbell Lunges|Dumbbell Lying One-Arm Rear Lateral Raise|Dumbbell Lying Pronation|Dumbbell Lying Rear Lateral Raise|Dumbbell Lying Supination|Dumbbell One-Arm Shoulder Press|Dumbbell One-Arm Triceps Extension|Dumbbell One-Arm Upright Row|Dumbbell Prone Incline Curl|Dumbbell Raise|Dumbbell Rear Lunge|Dumbbell Scaption|Dumbbell Seated Box Jump|Dumbbell Seated One-Leg Calf Raise|Dumbbell Shoulder Press|Dumbbell Shrug|Dumbbell Side Bend|Dumbbell Squat|Dumbbell Squat To A Bench|Dumbbell Step Ups|Dumbbell Tricep Extension -Pronated Grip|Dynamic Back Stretch|Dynamic Chest Stretch|EZ-Bar Curl|EZ-Bar Skullcrusher|Elbow Circles|Elbow to Knee|Elbows Back|Elevated Back Lunge|Elevated Cable Rows|Elliptical Trainer|Exercise Ball Crunch|Exercise Ball Pull-In|Extended Range One-Arm Kettlebell Floor Press|External Rotation|External Rotation with Band|External Rotation with Cable|Face Pull|Farmer's Walk|Fast Skipping|Finger Curls|Flat Bench Cable Flyes|Flat Bench Leg Pull-In|Flat Bench Lying Leg Raise|Flexor Incline Dumbbell Curls|Floor Glute-Ham Raise|Floor Press|Floor Press with Chains|Flutter Kicks|Foot-SMR|Forward Drag with Press|Frankenstein Squat|Freehand Jump Squat|Frog Hops|Frog Sit-Ups|Front Barbell Squat|Front Barbell Squat To A Bench|Front Box Jump|Front Cable Raise|Front Cone Hops (or hurdle hops)|Front Dumbbell Raise|Front Incline Dumbbell Raise|Front Leg Raises|Front Plate Raise|Front Raise And Pullover|Front Squat (Clean Grip)|Front Squats With Two Kettlebells|Front Two-Dumbbell Raise|Full Range-Of-Motion Lat Pulldown|Gironda Sternum Chins|Glute Ham Raise|Glute Kickback|Goblet Squat|Good Morning|Good Morning off Pins|Gorilla Chin/Crunch|Groin and Back Stretch|Groiners|Hack Squat|Hammer Curls|Hammer Grip Incline DB Bench Press|Hamstring Stretch|Hamstring-SMR|Handstand Push-Ups|Hang Clean|Hang Clean - Below the Knees|Hang Snatch|Hang Snatch - Below Knees|Hanging Bar Good Morning|Hanging Leg Raise|Hanging Pike|Heaving Snatch Balance|Heavy Bag Thrust|High Cable Curls|Hip Circles (prone)|Hip Extension with Bands|Hip Flexion with Band|Hip Lift with Band|Hug A Ball|Hug Knees To Chest|Hurdle Hops|Hyperextensions (Back Extensions)|Hyperextensions With No Hyperextension Bench|IT Band and Glute Stretch|Iliotibial Tract-SMR|Inchworm|Incline Barbell Triceps Extension|Incline Bench Pull|Incline Cable Chest Press|Incline Cable Flye|Incline Dumbbell Bench With Palms Facing In|Incline Dumbbell Curl|Incline Dumbbell Flyes|Incline Dumbbell Flyes - With A Twist|Incline Dumbbell Press|Incline Hammer Curls|Incline Inner Biceps Curl|Incline Push-Up|Incline Push-Up Close-Grip|Incline Push-Up Depth Jump|Incline Push-Up Medium|Incline Push-Up Reverse Grip|Incline Push-Up Wide|Intermediate Groin Stretch|Intermediate Hip Flexor and Quad Stretch|Internal Rotation with Band|Inverted Row|Inverted Row with Straps|Iron Cross|Iron Crosses (stretch)|Isometric Chest Squeezes|Isometric Neck Exercise - Front And Back|Isometric Neck Exercise - Sides|Isometric Wipers|JM Press|Jackknife Sit-Up|Janda Sit-Up|Jefferson Squats|Jerk Balance|Jerk Dip Squat|Jogging, Treadmill|Keg Load|Kettlebell Arnold Press|Kettlebell Dead Clean|Kettlebell Figure 8|Kettlebell Hang Clean|Kettlebell One-Legged Deadlift|Kettlebell Pass Between The Legs|Kettlebell Pirate Ships|Kettlebell Pistol Squat|Kettlebell Seated Press|Kettlebell Seesaw Press|Kettlebell Sumo High Pull|Kettlebell Thruster|Kettlebell Turkish Get-Up (Lunge style)|Kettlebell Turkish Get-Up (Squat style)|Kettlebell Windmill|Kipping Muscle Up|Knee Across The Body|Knee Circles|Knee Tuck Jump|Knee/Hip Raise On Parallel Bars|Kneeling Arm Drill|Kneeling Cable Crunch With Alternating Oblique Twists|Kneeling Cable Triceps Extension|Kneeling Forearm Stretch|Kneeling High Pulley Row|Kneeling Hip Flexor|Kneeling Jump Squat|Kneeling Single-Arm High Pulley Row|Kneeling Squat|Landmine 180's|Landmine Linear Jammer|Lateral Bound|Lateral Box Jump|Lateral Cone Hops|Lateral Raise - With Bands|Latissimus Dorsi-SMR|Leg Extensions|Leg Lift|Leg Press|Leg Pull-In|Leg-Over Floor Press|Leg-Up Hamstring Stretch|Leverage Chest Press|Leverage Deadlift|Leverage Decline Chest Press|Leverage High Row|Leverage Incline Chest Press|Leverage Iso Row|Leverage Shoulder Press|Leverage Shrug|Linear 3-Part Start Technique|Linear Acceleration Wall Drill|Linear Depth Jump|Log Lift|London Bridges|Looking At Ceiling|Low Cable Crossover|Low Cable Triceps Extension|Low Pulley Row To Neck|Lower Back Curl|Lower Back-SMR|Lunge Pass Through|Lunge Sprint|Lying Bent Leg Groin|Lying Cable Curl|Lying Cambered Barbell Row|Lying Close-Grip Bar Curl On High Pulley|Lying Close-Grip Barbell Triceps Extension Behind The Head|Lying Close-Grip Barbell Triceps Press To Chin|Lying Crossover|Lying Dumbbell Tricep Extension|Lying Face Down Plate Neck Resistance|Lying Face Up Plate Neck Resistance|Lying Glute|Lying Hamstring|Lying High Bench Barbell Curl|Lying Leg Curls|Lying Machine Squat|Lying One-Arm Lateral Raise|Lying Prone Quadriceps|Lying Rear Delt Raise|Lying Supine Dumbbell Curl|Lying T-Bar Row|Lying Triceps Press|Machine Bench Press|Machine Bicep Curl|Machine Preacher Curls|Machine Shoulder (Military) Press|Machine Triceps Extension|Medicine Ball Chest Pass|Medicine Ball Full Twist|Medicine Ball Scoop Throw|Middle Back Shrug|Middle Back Stretch|Mixed Grip Chin|Monster Walk|Mountain Climbers|Moving Claw Series|Muscle Snatch|Muscle Up|Narrow Stance Hack Squats|Narrow Stance Leg Press|Narrow Stance Squats|Natural Glute Ham Raise|Neck Press|Neck-SMR|Oblique Crunches|Oblique Crunches - On The Floor|Olympic Squat|On Your Side Quad Stretch|On-Your-Back Quad Stretch|One Arm Against Wall|One Arm Chin-Up|One Arm Dumbbell Bench Press|One Arm Dumbbell Preacher Curl|One Arm Floor Press|One Arm Lat Pulldown|One Arm Pronated Dumbbell Triceps Extension|One Arm Supinated Dumbbell Triceps Extension|One Half Locust|One Handed Hang|One Knee To Chest|One Leg Barbell Squat|One-Arm Dumbbell Row|One-Arm Flat Bench Dumbbell Flye|One-Arm High-Pulley Cable Side Bends|One-Arm Incline Lateral Raise|One-Arm Kettlebell Clean|One-Arm Kettlebell Clean and Jerk|One-Arm Kettlebell Floor Press|One-Arm Kettlebell Jerk|One-Arm Kettlebell Military Press To The Side|One-Arm Kettlebell Para Press|One-Arm Kettlebell Push Press|One-Arm Kettlebell Row|One-Arm Kettlebell Snatch|One-Arm Kettlebell Split Jerk|One-Arm Kettlebell Split Snatch|One-Arm Kettlebell Swings|One-Arm Long Bar Row|One-Arm Medicine Ball Slam|One-Arm Open Palm Kettlebell Clean|One-Arm Overhead Kettlebell Squats|One-Arm Side Deadlift|One-Arm Side Laterals|One-Legged Cable Kickback|Open Palm Kettlebell Clean|Otis-Up|Overhead Cable Curl|Overhead Lat|Overhead Slam|Overhead Squat|Overhead Stretch|Overhead Triceps|Pallof Press|Pallof Press With Rotation|Palms-Down Dumbbell Wrist Curl Over A Bench|Palms-Down Wrist Curl Over A Bench|Palms-Up Barbell Wrist Curl Over A Bench|Palms-Up Dumbbell Wrist Curl Over A Bench|Parallel Bar Dip|Pelvic Tilt Into Bridge|Peroneals Stretch|Peroneals-SMR|Physioball Hip Bridge|Pin Presses|Piriformis-SMR|Plank|Plate Pinch|Plate Twist|Platform Hamstring Slides|Plie Dumbbell Squat|Plyo Kettlebell Pushups|Plyo Push-up|Posterior Tibialis Stretch|Power Clean|Power Clean from Blocks|Power Jerk|Power Partials|Power Snatch|Power Snatch from Blocks|Power Stairs|Preacher Curl|Preacher Hammer Dumbbell Curl|Press Sit-Up|Prone Manual Hamstring|Prowler Sprint|Pull Through|Pullups|Push Press|Push Press - Behind the Neck|Push Up to Side Plank|Push-Up Wide|Push-Ups - Close Triceps Position|Push-Ups With Feet Elevated|Push-Ups With Feet On An Exercise Ball|Pushups|Pushups (Close and Wide Hand Positions)|Pyramid|Quad Stretch|Quadriceps-SMR|Quick Leap|Rack Delivery|Rack Pull with Bands|Rack Pulls|Rear Leg Raises|Recumbent Bike|Return Push from Stance|Reverse Band Bench Press|Reverse Band Box Squat|Reverse Band Deadlift|Reverse Band Power Squat|Reverse Band Sumo Deadlift|Reverse Barbell Curl|Reverse Barbell Preacher Curls|Reverse Cable Curl|Reverse Crunch|Reverse Flyes|Reverse Flyes With External Rotation|Reverse Grip Bent-Over Rows|Reverse Grip Triceps Pushdown|Reverse Hyperextension|Reverse Machine Flyes|Reverse Plate Curls|Reverse Triceps Bench Press|Rhomboids-SMR|Rickshaw Carry|Rickshaw Deadlift|Ring Dips|Rocket Jump|Rocking Standing Calf Raise|Rocky Pull-Ups/Pulldowns|Romanian Deadlift|Romanian Deadlift from Deficit|Rope Climb|Rope Crunch|Rope Jumping|Rope Straight-Arm Pulldown|Round The World Shoulder Stretch|Rowing, Stationary|Runner's Stretch|Running, Treadmill|Russian Twist|Sandbag Load|Scapular Pull-Up|Scissor Kick|Scissors Jump|Seated Band Hamstring Curl|Seated Barbell Military Press|Seated Barbell Twist|Seated Bent-Over One-Arm Dumbbell Triceps Extension|Seated Bent-Over Rear Delt Raise|Seated Bent-Over Two-Arm Dumbbell Triceps Extension|Seated Biceps|Seated Cable Rows|Seated Cable Shoulder Press|Seated Calf Raise|Seated Calf Stretch|Seated Close-Grip Concentration Barbell Curl|Seated Dumbbell Curl|Seated Dumbbell Inner Biceps Curl|Seated Dumbbell Palms-Down Wrist Curl|Seated Dumbbell Palms-Up Wrist Curl|Seated Dumbbell Press|Seated Flat Bench Leg Pull-In|Seated Floor Hamstring Stretch|Seated Front Deltoid|Seated Glute|Seated Good Mornings|Seated Hamstring|Seated Hamstring and Calf Stretch|Seated Head Harness Neck Resistance|Seated Leg Curl|Seated Leg Tucks|Seated One-Arm Dumbbell Palms-Down Wrist Curl|Seated One-Arm Dumbbell Palms-Up Wrist Curl|Seated One-arm Cable Pulley Rows|Seated Overhead Stretch|Seated Palm-Up Barbell Wrist Curl|Seated Palms-Down Barbell Wrist Curl|Seated Side Lateral Raise|Seated Triceps Press|Seated Two-Arm Palms-Up Low-Pulley Wrist Curl|See-Saw Press (Alternating Side Press)|Shotgun Row|Shoulder Circles|Shoulder Press - With Bands|Shoulder Raise|Shoulder Stretch|Side Bridge|Side Hop-Sprint|Side Jackknife|Side Lateral Raise|Side Laterals to Front Raise|Side Leg Raises|Side Lying Groin Stretch|Side Neck Stretch|Side Standing Long Jump|Side To Side Chins|Side Wrist Pull|Side to Side Box Shuffle|Side-Lying Floor Stretch|Single Dumbbell Raise|Single Leg Butt Kick|Single Leg Glute Bridge|Single Leg Push-off|Single-Arm Cable Crossover|Single-Arm Linear Jammer|Single-Arm Push-Up|Single-Cone Sprint Drill|Single-Leg High Box Squat|Single-Leg Hop Progression|Single-Leg Lateral Hop|Single-Leg Leg Extension|Single-Leg Stride Jump|Sit Squats|Sit-Up|Skating|Sled Drag - Harness|Sled Overhead Backward Walk|Sled Overhead Triceps Extension|Sled Push|Sled Reverse Flye|Sled Row|Sledgehammer Swings|Smith Incline Shoulder Raise|Smith Machine Behind the Back Shrug|Smith Machine Bench Press|Smith Machine Bent Over Row|Smith Machine Calf Raise|Smith Machine Close-Grip Bench Press|Smith Machine Decline Press|Smith Machine Hang Power Clean|Smith Machine Hip Raise|Smith Machine Incline Bench Press|Smith Machine Leg Press|Smith Machine One-Arm Upright Row|Smith Machine Overhead Shoulder Press|Smith Machine Pistol Squat|Smith Machine Reverse Calf Raises|Smith Machine Squat|Smith Machine Stiff-Legged Deadlift|Smith Machine Upright Row|Smith Single-Leg Split Squat|Snatch|Snatch Balance|Snatch Deadlift|Snatch Pull|Snatch Shrug|Snatch from Blocks|Speed Band Overhead Triceps|Speed Box Squat|Speed Squats|Spell Caster|Spider Crawl|Spider Curl|Spinal Stretch|Split Clean|Split Jerk|Split Jump|Split Snatch|Split Squat with Dumbbells|Split Squats|Squat Jerk|Squat with Bands|Squat with Chains|Squat with Plate Movers|Squats - With Bands|Stairmaster|Standing Alternating Dumbbell Press|Standing Barbell Calf Raise|Standing Barbell Press Behind Neck|Standing Bent-Over One-Arm Dumbbell Triceps Extension|Standing Bent-Over Two-Arm Dumbbell Triceps Extension|Standing Biceps Cable Curl|Standing Biceps Stretch|Standing Bradford Press|Standing Cable Chest Press|Standing Cable Lift|Standing Cable Wood Chop|Standing Calf Raises|Standing Concentration Curl|Standing Dumbbell Calf Raise|Standing Dumbbell Press|Standing Dumbbell Reverse Curl|Standing Dumbbell Straight-Arm Front Delt Raise Above Head|Standing Dumbbell Triceps Extension|Standing Dumbbell Upright Row|Standing Elevated Quad Stretch|Standing Front Barbell Raise Over Head|Standing Gastrocnemius Calf Stretch|Standing Hamstring and Calf Stretch|Standing Hip Circles|Standing Hip Flexors|Standing Inner-Biceps Curl|Standing Lateral Stretch|Standing Leg Curl|Standing Long Jump|Standing Low-Pulley Deltoid Raise|Standing Low-Pulley One-Arm Triceps Extension|Standing Military Press|Standing Olympic Plate Hand Squeeze|Standing One-Arm Cable Curl|Standing One-Arm Dumbbell Curl Over Incline Bench|Standing One-Arm Dumbbell Triceps Extension|Standing Overhead Barbell Triceps Extension|Standing Palm-In One-Arm Dumbbell Press|Standing Palms-In Dumbbell Press|Standing Palms-Up Barbell Behind The Back Wrist Curl|Standing Pelvic Tilt|Standing Rope Crunch|Standing Soleus And Achilles Stretch|Standing Toe Touches|Standing Towel Triceps Extension|Standing Two-Arm Overhead Throw|Star Jump|Step Mill|Step-up with Knee Raise|Stiff Leg Barbell Good Morning|Stiff-Legged Barbell Deadlift|Stiff-Legged Dumbbell Deadlift|Stomach Vacuum|Straight Bar Bench Mid Rows|Straight Raises on Incline Bench|Straight-Arm Dumbbell Pullover|Straight-Arm Pulldown|Stride Jump Crossover|Sumo Deadlift|Sumo Deadlift with Bands|Sumo Deadlift with Chains|Superman|Supine Chest Throw|Supine One-Arm Overhead Throw|Supine Two-Arm Overhead Throw|Suspended Fallout|Suspended Push-Up|Suspended Reverse Crunch|Suspended Row|Suspended Split Squat|Svend Press|T-Bar Row with Handle|Tate Press|The Straddle|Thigh Abductor|Thigh Adductor|Tire Flip|Toe Touchers|Torso Rotation|Trail Running/Walking|Trap Bar Deadlift|Tricep Dumbbell Kickback|Tricep Side Stretch|Triceps Overhead Extension with Rope|Triceps Pushdown|Triceps Pushdown - Rope Attachment|Triceps Pushdown - V-Bar Attachment|Triceps Stretch|Tuck Crunch|Two-Arm Dumbbell Preacher Curl|Two-Arm Kettlebell Clean|Two-Arm Kettlebell Jerk|Two-Arm Kettlebell Military Press|Two-Arm Kettlebell Row|Underhand Cable Pulldowns|Upper Back Stretch|Upper Back-Leg Grab|Upright Barbell Row|Upright Cable Row|Upright Row - With Bands|Upward Stretch|V-Bar Pulldown|V-Bar Pullup|Vertical Swing|Walking, Treadmill|Weighted Ball Hyperextension|Weighted Ball Side Bend|Weighted Bench Dip|Weighted Crunches|Weighted Jump Squat|Weighted Pull Ups|Weighted Sissy Squat|Weighted Sit-Ups - With Bands|Weighted Squat|Wide Stance Barbell Squat|Wide Stance Stiff Legs|Wide-Grip Barbell Bench Press|Wide-Grip Decline Barbell Bench Press|Wide-Grip Decline Barbell Pullover|Wide-Grip Lat Pulldown|Wide-Grip Pulldown Behind The Neck|Wide-Grip Rear Pull-Up|Wide-Grip Standing Barbell Curl|Wind Sprints|Windmills|World's Greatest Stretch|Wrist Circles|Wrist Roller|Wrist Rotations with Straight Bar|Yoke Walk|Zercher Squats|Zottman Curl|Zottman Preacher Curl".split("|");
-const PHOTO_PREFERRED = {"ab wheel":"Ab_Roller","arnold press":"Arnold_Dumbbell_Press","back squat":"Barbell_Squat","band row":"Seated_Cable_Rows","barbell curl":"Barbell_Curl","barbell row":"Bent_Over_Barbell_Row","bench press":"Barbell_Bench_Press_-_Medium_Grip","biceps curl":"Dumbbell_Bicep_Curl","bike":"Bicycling_Stationary","bodyweight squat":"Bodyweight_Squat","box jump":"Front_Box_Jump","bulgarian split squat":"Dumbbell_Rear_Lunge","cable crunch":"Cable_Crunch","cable fly":"Cable_Crossover","calf raise":"Standing_Calf_Raises","chest fly":"Dumbbell_Flyes","chin-up":"Chin-Up","clean":"Power_Clean","clean and jerk":"Clean_and_Jerk","close-grip bench press":"Close-Grip_Barbell_Bench_Press","crunch":"Crunches","deadlift":"Barbell_Deadlift","dip":"Dips_-_Triceps_Version","dumbbell bench press":"Dumbbell_Bench_Press","dumbbell row":"One-Arm_Dumbbell_Row","dumbbell shoulder press":"Dumbbell_Shoulder_Press","elliptical":"Elliptical_Trainer","face pull":"Face_Pull","farmer's walk":"Farmers_Walk","front raise":"Front_Dumbbell_Raise","front squat":"Front_Barbell_Squat","glute bridge":"Butt_Lift_Bridge","goblet squat":"Goblet_Squat","good morning":"Good_Morning","hammer curl":"Hammer_Curls","hanging leg raise":"Hanging_Leg_Raise","hip thrust":"Barbell_Hip_Thrust","hyperextension":"Hyperextensions_Back_Extensions","incline bench press":"Barbell_Incline_Bench_Press_-_Medium_Grip","incline dumbbell press":"Incline_Dumbbell_Press","jump rope":"Rope_Jumping","kettlebell swing":"One-Arm_Kettlebell_Swings","lat pulldown":"Wide-Grip_Lat_Pulldown","lateral raise":"Side_Lateral_Raise","leg curl":"Lying_Leg_Curls","leg extension":"Leg_Extensions","leg press":"Leg_Press","lunge":"Dumbbell_Lunges","mountain climber":"Mountain_Climbers","overhead press":"Barbell_Shoulder_Press","plank":"Plank","preacher curl":"Preacher_Curl","pull-up":"Pullups","push-up":"Pushups","rear delt fly":"Reverse_Flyes","romanian deadlift":"Romanian_Deadlift","rowing machine":"Rowing_Stationary","run":"Running_Treadmill","russian twist":"Russian_Twist","seated cable row":"Seated_Cable_Rows","shrug":"Barbell_Shrug","side plank":"Side_Bridge","sit-up":"Sit-Up","skullcrusher":"EZ-Bar_Skullcrusher","snatch":"Power_Snatch","sumo deadlift":"Sumo_Deadlift","t-bar row":"T-Bar_Row_with_Handle","thruster":"Kettlebell_Thruster","triceps extension":"Triceps_Pushdown","triceps pushdown":"Triceps_Pushdown","upright row":"Upright_Barbell_Row","walking lunge":"Barbell_Walking_Lunge","wrist curl":"Palms-Up_Barbell_Wrist_Curl_Over_A_Bench"};
+const PHOTO_PREFERRED = {"ab wheel":"Ab_Roller","arnold press":"Arnold_Dumbbell_Press","back squat":"Barbell_Squat","band row":"Seated_Cable_Rows","barbell curl":"Barbell_Curl","barbell row":"Bent_Over_Barbell_Row","bench press":"Barbell_Bench_Press_-_Medium_Grip","biceps curl":"Dumbbell_Bicep_Curl","bike":"Bicycling_Stationary","bodyweight squat":"Bodyweight_Squat","box jump":"Front_Box_Jump","bulgarian split squat":"Dumbbell_Rear_Lunge","cable crunch":"Cable_Crunch","cable fly":"Cable_Crossover","calf raise":"Standing_Calf_Raises","chest fly":"Dumbbell_Flyes","chin-up":"Chin-Up","clean":"Power_Clean","clean and jerk":"Clean_and_Jerk","close-grip bench press":"Close-Grip_Barbell_Bench_Press","crunch":"Crunches","deadlift":"Barbell_Deadlift","dip":"Dips_-_Triceps_Version","dumbbell bench press":"Dumbbell_Bench_Press","dumbbell row":"One-Arm_Dumbbell_Row","dumbbell shoulder press":"Dumbbell_Shoulder_Press","elliptical":"Elliptical_Trainer","face pull":"Face_Pull","farmer's walk":"Farmers_Walk","front raise":"Front_Dumbbell_Raise","front squat":"Front_Barbell_Squat","glute bridge":"Butt_Lift_Bridge","goblet squat":"Goblet_Squat","good morning":"Good_Morning","hammer curl":"Hammer_Curls","hanging leg raise":"Hanging_Leg_Raise","hip thrust":"Barbell_Hip_Thrust","hyperextension":"Hyperextensions_Back_Extensions","incline bench press":"Barbell_Incline_Bench_Press_-_Medium_Grip","incline dumbbell press":"Incline_Dumbbell_Press","jump rope":"Rope_Jumping","kettlebell swing":"One-Arm_Kettlebell_Swings","lat pulldown":"Wide-Grip_Lat_Pulldown","lateral raise":"Side_Lateral_Raise","leg curl":"Lying_Leg_Curls","leg extension":"Leg_Extensions","leg press":"Leg_Press","lunge":"Dumbbell_Lunges","mountain climber":"Mountain_Climbers","overhead press":"Barbell_Shoulder_Press","plank":"Plank","preacher curl":"Preacher_Curl","pull-up":"Pullups","push-up":"Pushups","rear delt fly":"Reverse_Flyes","romanian deadlift":"Romanian_Deadlift","rowing machine":"Rowing_Stationary","run":"Running_Treadmill","russian twist":"Russian_Twist","seated cable row":"Seated_Cable_Rows","shrug":"Barbell_Shrug","side plank":"Side_Bridge","sit-up":"Sit-Up","skullcrusher":"EZ-Bar_Skullcrusher","snatch":"Power_Snatch","sumo deadlift":"Sumo_Deadlift","t-bar row":"T-Bar_Row_with_Handle","thruster":"Kettlebell_Thruster","triceps extension":"Triceps_Pushdown","triceps pushdown":"Triceps_Pushdown","upright row":"Upright_Barbell_Row","walking lunge":"Barbell_Walking_Lunge","walk":"Walking_Treadmill","stair climber":"Stairmaster","wrist curl":"Palms-Up_Barbell_Wrist_Curl_Over_A_Bench"};
 const PHOTO_SYNONYM = {
   "back squat": "barbell squat", "chest fly": "dumbbell flyes", "pec deck": "butterfly",
   "ab wheel": "ab roller", "bicycle crunch": "air bike", "jump rope": "rope jumping",
@@ -648,7 +688,7 @@ const GEAR = [
   ["bands", "Resistance bands"], ["pullup-bar", "Pull-up bar"], ["machines", "Gym machines"], ["cardio", "Cardio machines"],
 ];
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const emptyEx = () => ({ name: "", sets: "", reps: "", weight: "", rpe: "" });
+const emptyEx = () => ({ name: "", sets: "", reps: "", weight: "", rpe: "", mins: "", km: "", mode: "" });
 
 /* ================= gamification ================= */
 const xpOf = (ws) => ws.reduce((s, w) => s + 50 + w.exercises.length * 10, 0);
@@ -1049,6 +1089,8 @@ export default function Forge() {
       if (!weekList12.includes(k)) return;
       w.exercises.forEach((e) => {
         const g = groupFor(e.name);
+        // timed work has no set volume; the fallback below would invent some
+        if (g === "Cardio" || isTimedEx(e)) return;
         const v = (+e.sets || 0) * (+e.reps || 0) * (+e.weight || 0) || (+e.sets || 1) * 20;
         map[g] = map[g] || {};
         map[g][k] = (map[g][k] || 0) + v;
@@ -1062,6 +1104,29 @@ export default function Forge() {
       }))
       .sort((a, b) => b.total - a.total)
       .slice(0, 5);
+  })();
+
+  // --- cardio: minutes and distance, which sets×reps×kg can't see ---
+  const cardioEntries = workouts.flatMap((w) => w.exercises
+    .filter((e) => isTimedEx(e) && (+e.mins > 0 || +e.km > 0))
+    .map((e) => ({ date: w.date, name: e.name, mins: +e.mins || 0, km: +e.km || 0 })));
+  const cardioIn = (days) => {
+    const sel = cardioEntries.filter((c) => dayDiff(todayStr, c.date) <= days);
+    return {
+      n: sel.length,
+      mins: Math.round(sel.reduce((a, c) => a + c.mins, 0)),
+      km: round1(sel.reduce((a, c) => a + c.km, 0)),
+    };
+  };
+  const cardio7 = cardioIn(7);
+  const cardio28 = cardioIn(28);
+  const cardioByName = (() => {
+    const m = {};
+    cardioEntries.filter((c) => dayDiff(todayStr, c.date) <= 28).forEach((c) => {
+      m[c.name] = m[c.name] || { name: c.name, mins: 0, km: 0, n: 0 };
+      m[c.name].mins += c.mins; m[c.name].km += c.km; m[c.name].n++;
+    });
+    return Object.values(m).sort((a, b) => b.mins - a.mins);
   })();
 
   // --- e1RM trend for the big lifts ---
@@ -1262,7 +1327,11 @@ export default function Forge() {
     if (!k) return null;
     for (const w of workouts) { // workouts are sorted newest-first
       const e = w.exercises.find((x) => x.name.trim().toLowerCase() === k);
-      if (e) return { sets: e.sets, reps: e.reps, weight: +e.weight || 0, rpe: e.rpe || "", date: w.date };
+      if (e) return {
+        sets: e.sets, reps: e.reps, weight: +e.weight || 0,
+        mins: e.mins || "", km: e.km || "", mode: exMode(e),
+        summary: exSummary(e), rpe: e.rpe || "", date: w.date,
+      };
     }
     return null;
   };
@@ -1325,9 +1394,10 @@ export default function Forge() {
   const exportJson = () => download("forge-backup-" + todayStr + ".json",
     JSON.stringify({ profile, workouts, bodyLog, plan, insights }, null, 2), "application/json");
   const exportCsv = () => {
-    const rows = [["date", "exercise", "sets", "reps", "weight_kg", "notes"]];
+    const rows = [["date", "exercise", "sets", "reps", "weight_kg", "minutes", "km", "rpe", "notes"]];
     workouts.forEach((w) => w.exercises.forEach((e, i) =>
-      rows.push([w.date, e.name, e.sets, e.reps, e.weight, i === 0 ? (w.notes || "").replace(/"/g, "'") : ""])));
+      rows.push([w.date, e.name, e.sets, e.reps, e.weight, e.mins || "", e.km || "", e.rpe || "",
+        i === 0 ? (w.notes || "").replace(/"/g, "'") : ""])));
     const csv = rows.map((r) => r.map((c) => `"${c ?? ""}"`).join(",")).join("\n");
     download("forge-log-" + todayStr + ".csv", csv, "text/csv");
   };
@@ -1525,6 +1595,7 @@ Respond ONLY with valid JSON, no markdown fences, no preamble:
  "tip": "one specific coaching tip for this athlete right now",
  "week": [
   {"day":"Mon","rest":false,"focus":"short session title","warmup":"one line warm-up specific to this session, e.g. 5 min bike then hip openers and 2 light sets of the first lift","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short load guidance"}]},
+  For cardio, carries or holds (run, bike, walk, row, swim, jump rope, plank, farmer's walk), use minutes instead of sets and reps: {"exercise":"Run","minutes":30,"load":"conversational pace, zone 2"}.
   {"day":"Tue","rest":true,"note":"one-line recovery suggestion"}
  ]
 }
@@ -1552,9 +1623,14 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
 
   const sendToLog = (dayObj) => {
     if (!dayObj || !dayObj.exercises) return;
-    setExs(dayObj.exercises.map((e) => ({
-      name: e.exercise, sets: String(e.sets || ""), reps: String(e.reps || "").split("-")[0], weight: "",
-    })));
+    setExs(dayObj.exercises.map((e) => (
+      (e.minutes || isTimedName(e.exercise))
+        ? { ...emptyEx(), name: e.exercise, mode: "time", mins: String(e.minutes || "") }
+        : {
+          ...emptyEx(), name: e.exercise, mode: "reps",
+          sets: String(e.sets || ""), reps: String(e.reps || "").split("-")[0], weight: "",
+        }
+    )));
     setDate(todayStr);
     setTab("log");
   };
@@ -1564,10 +1640,17 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
     if (!dayObj || !dayObj.exercises) return;
     const sessionEx = dayObj.exercises.map((e) => {
       const perf = lastPerfFor(e.exercise);
+      if (e.minutes || isTimedName(e.exercise)) {
+        const targetMins = String(e.minutes || String(e.reps || "").replace(/[^\d.]/g, "") || 20);
+        return {
+          name: e.exercise, load: e.load || "", mode: "time", targetMins,
+          sets: [{ mins: "", km: "", done: false, rpe: "", startedAt: null }],
+        };
+      }
       const targetSets = +e.sets || 3;
       const targetReps = String(e.reps || "8");
       return {
-        name: e.exercise, load: e.load || "", targetSets, targetReps,
+        name: e.exercise, load: e.load || "", mode: "reps", targetSets, targetReps,
         sets: Array.from({ length: targetSets }).map(() => ({
           reps: targetReps.split("-")[0],
           weight: perf && perf.weight ? String(perf.weight) : "",
@@ -1599,12 +1682,23 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
       if (!ds.length) return null;
       const weight = Math.max(...ds.map((s) => +s.weight || 0));
       const rpes = ds.map((x) => +x.rpe).filter((v) => v > 0);
+      const rpe = rpes.length ? String(round1(rpes.reduce((a, b) => a + b, 0) / rpes.length)) : "";
+      if (isTimedEx(ex)) {
+        const mins = ds.reduce((a, s) => a + (+s.mins || 0), 0);
+        const km = ds.reduce((a, s) => a + (+s.km || 0), 0);
+        return {
+          name: canonicalName(ex.name), mode: "time",
+          mins: mins ? String(round1(mins)) : "", km: km ? String(round1(km)) : "",
+          sets: "", reps: "", weight: "", rpe,
+        };
+      }
       return {
         name: canonicalName(ex.name),
+        mode: "reps",
         sets: String(ds.length),
         reps: String(ds[ds.length - 1].reps || ""),
         weight: weight ? String(weight) : "",
-        rpe: rpes.length ? String(round1(rpes.reduce((a, b) => a + b, 0) / rpes.length)) : "",
+        rpe,
       };
     }).filter(Boolean);
     if (!entries.length) { discardLive(); return; }
@@ -1855,7 +1949,8 @@ Total volume: ${Math.round(totalVolume)}. Total kg lifted (weighted work only): 
 Muscle groups, last 28 days:
 ${muscleSummary}
 Push sets ${pushSets} vs pull sets ${pullSets}. Upper ${upperSets} vs lower ${lowerSets}.
-PRs: ${JSON.stringify(prList.slice(0, 6))}
+${cardio28.n ? `Cardio and timed work is logged in minutes, not sets — it carries zero lifting volume by design, so do NOT read it as a missed or empty session. Last 7 days: ${cardio7.n} sessions, ${cardio7.mins} min${cardio7.km ? `, ${cardio7.km} km` : ""}. Last 28 days: ${cardio28.n} sessions, ${cardio28.mins} min${cardio28.km ? `, ${cardio28.km} km` : ""}. By movement: ${cardioByName.slice(0, 5).map((c) => `${c.name} ${c.mins} min${c.km ? `/${c.km} km` : ""}`).join(", ")}.
+` : ""}PRs: ${JSON.stringify(prList.slice(0, 6))}
 Body weight log: ${JSON.stringify(bwSorted.slice(-6))}
 ${(profile.injuries || []).length ? `Injuries/limitations: ${profile.injuries.join("; ")}
 ` : ""}${whoop && whoop.recovery != null ? `WHOOP today: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr}, sleep ${whoop.sleepHours}h, strain ${whoop.strain}
@@ -2766,9 +2861,9 @@ Respond ONLY with valid JSON, no markdown fences:
                                 <div style={{ flex: 1 }}>
                                   <div style={{ fontWeight: 700, fontSize: 15 }}>{e.exercise} <span style={{ color: T.sub, fontWeight: 400, fontSize: 12 }}>ⓘ</span></div>
                                   {e.load && <div style={{ fontSize: 12.5, color: T.sub, marginTop: 2 }}>{e.load}</div>}
-                                  {perf && perf.weight > 0 && (
+                                  {perf && (perf.mode === "time" ? !!perf.summary : perf.weight > 0) && (
                                     <div style={{ fontSize: 12, color: T.blue, marginTop: 2 }}>
-                                      Last: {perf.sets}×{perf.reps} @ {perf.weight}kg
+                                      Last: {perf.summary}
                                     </div>
                                   )}
                                 </div>
@@ -2779,7 +2874,11 @@ Respond ONLY with valid JSON, no markdown fences:
                                   }}>
                                   {swapBusy === `${openDay}-${i}` ? "…" : "⇄"}
                                 </button>
-                                <div style={{ ...mono, fontSize: 14, color: T.text, whiteSpace: "nowrap" }}>{e.sets}<span style={{ color: T.dim }}>×</span>{e.reps}</div>
+                                <div style={{ ...mono, fontSize: 14, color: T.text, whiteSpace: "nowrap" }}>
+                                  {(e.minutes || (isTimedName(e.exercise) && !e.sets))
+                                    ? `${e.minutes || e.reps} min`
+                                    : <>{e.sets}<span style={{ color: T.dim }}>×</span>{e.reps}</>}
+                                </div>
                               </div>
                             );
                           })}
@@ -2912,11 +3011,11 @@ Respond ONLY with valid JSON, no markdown fences:
                       {ex.name} <span onClick={() => openExercise(ex.name)} style={{ color: T.blue, fontSize: 12, cursor: "pointer" }}>ⓘ form</span>
                     </div>
                     <div style={{ fontSize: 12.5, color: T.sub }}>
-                      Target {ex.targetSets}×{ex.targetReps}{ex.load ? ` · ${ex.load}` : ""}
+                      {isTimedEx(ex) ? `Target ${ex.targetMins} min` : `Target ${ex.targetSets}×${ex.targetReps}`}{ex.load ? ` · ${ex.load}` : ""}
                     </div>
-                    {perf && perf.weight > 0 && (
+                    {perf && (perf.mode === "time" ? !!perf.summary : perf.weight > 0) && (
                       <div style={{ fontSize: 12.5, color: T.blue, marginTop: 2 }}>
-                        Last time: {perf.sets}×{perf.reps} @ {perf.weight}kg{nextW ? ` — try ${nextW}kg` : ""}
+                        Last time: {perf.summary}{perf.mode !== "time" && nextW ? ` — try ${nextW}kg` : ""}
                       </div>
                     )}
                   </div>
@@ -2926,6 +3025,7 @@ Respond ONLY with valid JSON, no markdown fences:
                 </div>
 
                 {(() => {
+                  if (isTimedEx(ex)) return null;
                   const ww = parseFloat(((ex.sets.find((s) => !s.done) || ex.sets[0]) || {}).weight);
                   const ramp = warmupRamp(ww);
                   if (!ramp) return null;
@@ -2939,6 +3039,65 @@ Respond ONLY with valid JSON, no markdown fences:
                   );
                 })()}
 
+                {isTimedEx(ex) ? (() => {
+                  const s = ex.sets[0];
+                  const running = !!s.startedAt && !s.done;
+                  const secs = running
+                    ? Math.max(0, Math.floor((nowTs - s.startedAt) / 1000))
+                    : Math.round((+s.mins || 0) * 60);
+                  const stopAt = (st) => {
+                    if (!st.startedAt) return;
+                    st.mins = String(Math.max(0.1, Math.round(((Date.now() - st.startedAt) / 60000) * 10) / 10));
+                    st.startedAt = null;
+                  };
+                  return (
+                    <>
+                      <div style={{
+                        ...mono, fontSize: 44, fontWeight: 500, letterSpacing: "-0.04em",
+                        textAlign: "center", padding: "10px 0 14px",
+                        color: running ? T.accent : s.done ? T.good : T.text,
+                      }}>
+                        {fmtClock(secs)}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                        <input inputMode="decimal" placeholder="min" value={s.mins} disabled={s.done}
+                          onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[0].mins = e.target.value; })}
+                          style={{ ...S.inputNum, flex: 1 }} />
+                        <input inputMode="decimal" placeholder="km" value={s.km} disabled={s.done}
+                          onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[0].km = e.target.value; })}
+                          style={{ ...S.inputNum, flex: 1 }} />
+                        {s.done && (
+                          <input inputMode="decimal" placeholder="RPE" value={s.rpe}
+                            onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[0].rpe = e.target.value; }, true)}
+                            style={{ ...S.inputNum, width: 64, flex: "none" }} />
+                        )}
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button style={{ ...S.ghost, flex: 1, opacity: s.done ? 0.4 : 1 }} disabled={s.done}
+                          onClick={() => updLive((nl) => {
+                            const st = nl.exercises[nl.idx].sets[0];
+                            if (st.startedAt) stopAt(st); else st.startedAt = Date.now();
+                          }, true)}>
+                          {running ? "■ Stop" : s.mins ? "▶ Restart timer" : "▶ Start timer"}
+                        </button>
+                        <button
+                          onClick={() => updLive((nl) => {
+                            const st = nl.exercises[nl.idx].sets[0];
+                            if (!st.done) stopAt(st);
+                            st.done = !st.done;
+                          }, true)}
+                          style={{
+                            flex: 1, padding: "11px 0", borderRadius: 8, cursor: "pointer", fontSize: 11.5,
+                            border: "none", fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.11em", fontWeight: 700,
+                            background: s.done ? T.goodDim : T.accent,
+                            color: s.done ? T.good : "#17110E",
+                          }}>
+                          {s.done ? "✓ Logged" : "Log it"}
+                        </button>
+                      </div>
+                    </>
+                  );
+                })() : (<>
                 {ex.sets.map((s, si) => (
                   <div key={si} style={{
                     display: "flex", gap: 8, alignItems: "center", padding: "8px 0",
@@ -2980,6 +3139,7 @@ Respond ONLY with valid JSON, no markdown fences:
                   }, true)}>
                   + Extra set
                 </button>
+                </>)}
               </div>
 
               <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
@@ -3022,14 +3182,30 @@ Respond ONLY with valid JSON, no markdown fences:
                     <input placeholder="Exercise" list="lib" value={ex.name}
                       onChange={(e) => setExs((a) => a.map((x, j) => j === i ? { ...x, name: e.target.value } : x))}
                       style={{ ...S.input, background: T.surface, marginBottom: 8 }} />
-                    <div style={{ display: "flex", gap: 8 }}>
-                      {["sets", "reps", "weight", "rpe"].map((f) => (
-                        <input key={f} placeholder={f === "weight" ? "kg" : f === "rpe" ? "RPE" : f}
-                          inputMode="decimal" value={ex[f]}
-                          onChange={(e) => setExs((a) => a.map((x, j) => j === i ? { ...x, [f]: e.target.value } : x))}
-                          style={{ ...S.inputNum }} />
-                      ))}
-                    </div>
+                    {(() => {
+                      const mode = exMode(ex);
+                      const fields = mode === "time"
+                        ? [["mins", "min"], ["km", "km"], ["rpe", "RPE"]]
+                        : [["sets", "sets"], ["reps", "reps"], ["weight", "kg"], ["rpe", "RPE"]];
+                      return (
+                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          {fields.map(([f, ph]) => (
+                            <input key={f} placeholder={ph} inputMode="decimal" value={ex[f] || ""}
+                              onChange={(e) => setExs((a) => a.map((x, j) => j === i ? { ...x, [f]: e.target.value } : x))}
+                              style={{ ...S.inputNum }} />
+                          ))}
+                          <button title={mode === "time" ? "Logging time — switch to sets and reps" : "Logging reps — switch to time"}
+                            onClick={() => setExs((a) => a.map((x, j) => j === i
+                              ? { ...x, mode: mode === "time" ? "reps" : "time" } : x))}
+                            style={{
+                              background: T.surface, border: `1px solid ${T.line}`, color: T.blue, flex: "none",
+                              borderRadius: 8, padding: "10px 11px", cursor: "pointer", fontSize: 13, lineHeight: 1,
+                            }}>
+                            {mode === "time" ? "⏱" : "#"}
+                          </button>
+                        </div>
+                      );
+                    })()}
                     {(() => {
                       const perf = lastPerfFor(ex.name);
                       if (!perf || (!ex.name.trim())) return null;
@@ -3037,12 +3213,14 @@ Respond ONLY with valid JSON, no markdown fences:
                       return (
                         <div style={{ fontSize: 12, color: T.sub, marginTop: 7, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                           <span>
-                            Last: {perf.sets}×{perf.reps}{perf.weight ? ` @ ${perf.weight}kg` : ""} ({perf.date})
-                            {nextW ? <> · <b style={{ color: T.good }}>try {nextW}kg</b></> : null}
+                            Last: {perf.summary || "—"} ({perf.date})
+                            {perf.mode !== "time" && nextW ? <> · <b style={{ color: T.good }}>try {nextW}kg</b></> : null}
                           </span>
                           <button
                             onClick={() => setExs((a) => a.map((x, j) => j === i
-                              ? { ...x, sets: String(perf.sets || ""), reps: String(perf.reps || ""), weight: nextW ? String(nextW) : String(perf.weight || "") }
+                              ? (perf.mode === "time"
+                                ? { ...x, mode: "time", mins: String(perf.mins || ""), km: String(perf.km || "") }
+                                : { ...x, mode: "reps", sets: String(perf.sets || ""), reps: String(perf.reps || ""), weight: nextW ? String(nextW) : String(perf.weight || "") })
                               : x))}
                             style={{ background: "none", border: `1px solid ${T.line}`, color: T.blue, borderRadius: 6, padding: "3px 8px", fontSize: 11.5, fontWeight: 700, cursor: "pointer" }}>
                             Use
@@ -3116,9 +3294,7 @@ Respond ONLY with valid JSON, no markdown fences:
                   <div key={i} onClick={() => openExercise(e.name)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: `1px solid ${T.line}`, cursor: "pointer" }}>
                     <ExIcon name={e.name} size={30} color={T.sub} />
                     <span style={{ flex: 1, fontSize: 14 }}>{e.name}</span>
-                    <span style={{ color: T.sub, fontSize: 13.5 }}>
-                      {e.sets && `${e.sets}×`}{e.reps}{e.weight && ` @ ${e.weight}kg`}
-                    </span>
+                    <span style={{ color: T.sub, fontSize: 13.5 }}>{exSummary(e)}</span>
                   </div>
                 ))}
                 {w.notes && <div style={{ fontSize: 13, color: T.sub, marginTop: 8, fontStyle: "italic" }}>{w.notes}</div>}
@@ -3204,6 +3380,40 @@ Respond ONLY with valid JSON, no markdown fences:
             </div>
 
             </>)}
+
+            {/* cardio — minutes and distance, which volume can't show */}
+            {statView === "overview" && cardio28.n > 0 && (
+              <div style={S.card}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                  <Rule label="Cardio & timed work" right="last 28 days" />
+                </div>
+                <div style={{ display: "flex", gap: 18, marginBottom: cardioByName.length ? 12 : 0 }}>
+                  <div>
+                    <div style={{ ...mono, fontSize: 24, color: T.accent }}>{cardio28.mins}</div>
+                    <div style={S.tileLab}>minutes</div>
+                  </div>
+                  {cardio28.km > 0 && (
+                    <div>
+                      <div style={{ ...mono, fontSize: 24, color: T.accent }}>{cardio28.km}</div>
+                      <div style={S.tileLab}>km</div>
+                    </div>
+                  )}
+                  <div>
+                    <div style={{ ...mono, fontSize: 24, color: T.text }}>{cardio7.mins}</div>
+                    <div style={S.tileLab}>min this week</div>
+                  </div>
+                </div>
+                {cardioByName.slice(0, 5).map((c) => (
+                  <div key={c.name} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: `1px solid ${T.line}` }}>
+                    <ExIcon name={c.name} size={26} color={T.sub} />
+                    <span style={{ flex: 1, fontSize: 13.5 }}>{c.name}</span>
+                    <span style={{ color: T.sub, fontSize: 13 }}>
+                      {c.n}× · {Math.round(c.mins)} min{c.km ? ` · ${round1(c.km)} km` : ""}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {/* adherence */}
             {statView === "overview" && (<>
