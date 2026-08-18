@@ -51,6 +51,19 @@ Tokens are stored in `whoop.json` on your volume and refreshed automatically.
 Recovery data is cached for 15 minutes and fed into weekly plans and the
 coach's training analysis.
 
+## Background auto-adjust
+
+With WHOOP connected, the server checks every 30 minutes whether today's
+recovery has synced. Once it has, it adjusts today's planned session in place
+(yellow recovery: ~10% lighter; red: 20-30% lighter with gentler lift swaps;
+green: untouched) — even if you never open the app. You'll see the ⚡ badge
+and an Undo button on the Plan tab. Runs at most once per day.
+
+Extra env vars:
+- `TIMEZONE` — IANA name so "today" matches your day, e.g.
+  `America/Argentina/Buenos_Aires`. Defaults to UTC.
+- `AUTO_ADJUST` — set to `off` to disable the background scheduler.
+
 ## Architecture
 
 - `src/App.jsx` — the whole UI (plan, log, history, stats, gamification).

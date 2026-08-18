@@ -123,44 +123,52 @@ app.get("/api/whoop/status", (_req, res) => {
   res.json({ configured: whoopConfigured(), connected: !!(t && t.access_token) });
 });
 
-app.get("/api/whoop/summary", async (_req, res) => {
-  if (whoopCache.data && Date.now() - whoopCache.at < 15 * 60 * 1000) return res.json(whoopCache.data);
+async function fetchWhoopSummary() {
   const at = await whoopAccessToken();
-  if (!at) return res.status(400).json({ error: "not connected" });
+  if (!at) return null;
   const j = async (p) => {
     const r = await fetch(WHOOP_HOST + "/developer/v2" + p, { headers: { Authorization: "Bearer " + at } });
     return r.ok ? r.json() : null;
   };
+  const [rec, slp, cyc] = await Promise.all([
+    j("/recovery?limit=1"),
+    j("/activity/sleep?limit=1"),
+    j("/cycle?limit=1"),
+  ]);
+  const recRec = rec && rec.records && rec.records[0];
+  const rs = (recRec && recRec.score) || {};
+  const sleepRec = slp && slp.records && slp.records[0];
+  const ss = (sleepRec && sleepRec.score) || {};
+  let sleepHours = null;
+  if (ss.stage_summary) {
+    const ms = (ss.stage_summary.total_light_sleep_time_milli || 0) +
+      (ss.stage_summary.total_slow_wave_sleep_time_milli || 0) +
+      (ss.stage_summary.total_rem_sleep_time_milli || 0);
+    if (ms > 0) sleepHours = Math.round(ms / 360000) / 10;
+  }
+  if (sleepHours === null && sleepRec && sleepRec.start && sleepRec.end) {
+    sleepHours = Math.round((new Date(sleepRec.end) - new Date(sleepRec.start)) / 360000) / 10;
+  }
+  const cs = (cyc && cyc.records && cyc.records[0] && cyc.records[0].score) || {};
+  const data = {
+    recovery: rs.recovery_score ?? null,
+    hrv: rs.hrv_rmssd_milli != null ? Math.round(rs.hrv_rmssd_milli) : null,
+    rhr: rs.resting_heart_rate ?? null,
+    sleepHours,
+    sleepPerf: ss.sleep_performance_percentage != null ? Math.round(ss.sleep_performance_percentage) : null,
+    strain: cs.strain != null ? Math.round(cs.strain * 10) / 10 : null,
+    recoveryCreatedAt: (recRec && (recRec.created_at || recRec.updated_at)) || null,
+    updated: new Date().toISOString(),
+  };
+  whoopCache = { at: Date.now(), data };
+  return data;
+}
+
+app.get("/api/whoop/summary", async (_req, res) => {
+  if (whoopCache.data && Date.now() - whoopCache.at < 15 * 60 * 1000) return res.json(whoopCache.data);
   try {
-    const [rec, slp, cyc] = await Promise.all([
-      j("/recovery?limit=1"),
-      j("/activity/sleep?limit=1"),
-      j("/cycle?limit=1"),
-    ]);
-    const rs = (rec && rec.records && rec.records[0] && rec.records[0].score) || {};
-    const sleepRec = slp && slp.records && slp.records[0];
-    const ss = (sleepRec && sleepRec.score) || {};
-    let sleepHours = null;
-    if (ss.stage_summary) {
-      const ms = (ss.stage_summary.total_light_sleep_time_milli || 0) +
-        (ss.stage_summary.total_slow_wave_sleep_time_milli || 0) +
-        (ss.stage_summary.total_rem_sleep_time_milli || 0);
-      if (ms > 0) sleepHours = Math.round(ms / 360000) / 10;
-    }
-    if (sleepHours === null && sleepRec && sleepRec.start && sleepRec.end) {
-      sleepHours = Math.round((new Date(sleepRec.end) - new Date(sleepRec.start)) / 360000) / 10;
-    }
-    const cs = (cyc && cyc.records && cyc.records[0] && cyc.records[0].score) || {};
-    const data = {
-      recovery: rs.recovery_score ?? null,
-      hrv: rs.hrv_rmssd_milli != null ? Math.round(rs.hrv_rmssd_milli) : null,
-      rhr: rs.resting_heart_rate ?? null,
-      sleepHours,
-      sleepPerf: ss.sleep_performance_percentage != null ? Math.round(ss.sleep_performance_percentage) : null,
-      strain: cs.strain != null ? Math.round(cs.strain * 10) / 10 : null,
-      updated: new Date().toISOString(),
-    };
-    whoopCache = { at: Date.now(), data };
+    const data = await fetchWhoopSummary();
+    if (!data) return res.status(400).json({ error: "not connected" });
     res.json(data);
   } catch (e) {
     res.status(502).json({ error: String(e) });
@@ -186,36 +194,114 @@ app.put("/api/exinfo", (req, res) => {
 });
 
 /* ---- Claude proxy: keeps your API key server-side ---- */
-app.post("/api/claude", async (req, res) => {
+/* ---- Claude helper (used by the API route and the auto-adjust scheduler) ---- */
+async function callClaude(prompt, maxTokens = 1500) {
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set" });
+  if (!key) throw new Error("ANTHROPIC_API_KEY is not set");
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: process.env.MODEL || "claude-sonnet-4-6",
+      max_tokens: Math.min(maxTokens || 1500, 4000),
+      messages: [{ role: "user", content: String(prompt || "") }],
+    }),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error((data.error && data.error.message) || "api error");
+  return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+app.post("/api/claude", async (req, res) => {
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: process.env.MODEL || "claude-sonnet-4-6",
-        max_tokens: Math.min(+req.body.max_tokens || 1500, 4000),
-        messages: [{ role: "user", content: String(req.body.prompt || "") }],
-      }),
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      return res.status(502).json({ error: (data.error && data.error.message) || "api error" });
-    }
-    const text = (data.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
+    const text = await callClaude(req.body.prompt, +req.body.max_tokens || 1500);
     res.json({ text });
   } catch (e) {
-    res.status(502).json({ error: String(e) });
+    res.status(502).json({ error: String(e.message || e) });
   }
 });
+
+/* ---- background auto-adjust ----
+   Every 30 minutes: once WHOOP has synced today's recovery, adjust
+   today's planned session in forge.json — no app open required.
+   Set TIMEZONE (IANA name, e.g. America/Argentina/Buenos_Aires) so
+   "today" matches your day, and AUTO_ADJUST=off to disable. */
+const TZNAME = process.env.TIMEZONE || "UTC";
+const GEAR_LABELS = {
+  barbell: "Barbell & plates", dumbbells: "Dumbbells", kettlebell: "Kettlebell",
+  bands: "Resistance bands", "pullup-bar": "Pull-up bar", machines: "Gym machines", cardio: "Cardio machines",
+};
+const dateInTz = (dt = new Date()) =>
+  new Intl.DateTimeFormat("en-CA", { timeZone: TZNAME, year: "numeric", month: "2-digit", day: "2-digit" }).format(dt);
+const weekdayIdxInTz = () => {
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: TZNAME, weekday: "short" }).format(new Date());
+  return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].indexOf(wd);
+};
+
+async function autoAdjustCheck() {
+  try {
+    if ((process.env.AUTO_ADJUST || "on") === "off") return;
+    if (!process.env.ANTHROPIC_API_KEY) return;
+    const data = readJson("forge.json", null);
+    if (!data || !data.profile || !data.plan || !Array.isArray(data.plan.week)) return;
+    const today = dateInTz();
+    const idx = weekdayIdxInTz();
+    if (idx < 0 || data.plan.adjustedDate === today) return;      // already handled today
+    const dy = data.plan.week[idx];
+    if (!dy || dy.rest || !dy.exercises || !dy.exercises.length) return;
+
+    const sum = await fetchWhoopSummary();
+    if (!sum || sum.recovery == null) return;                      // WHOOP not connected / no data
+    const recDay = sum.recoveryCreatedAt ? dateInTz(new Date(sum.recoveryCreatedAt)) : today;
+    if (recDay !== today) return;                                  // hasn't synced today yet — retry next tick
+
+    if (sum.recovery >= 67) {                                      // green: train as planned
+      data.plan.adjustedDate = today;
+      writeJson("forge.json", data);
+      console.log(`[auto-adjust] ${today}: recovery ${sum.recovery}% — no change needed`);
+      return;
+    }
+
+    const p = data.profile;
+    const gearLabels = (p.gear || []).length ? p.gear.map((g) => GEAR_LABELS[g] || g) : ["Bodyweight only"];
+    const prompt = `Adjust today's planned training session to the athlete's recovery. Change only what recovery demands.
+
+Athlete: ${p.level}, goal ${p.goal}.${(p.injuries || []).length ? ` Injuries: ${p.injuries.join("; ")}.` : ""}
+Equipment: ${gearLabels.join(", ")}.
+WHOOP today: recovery ${sum.recovery}%, HRV ${sum.hrv} ms, RHR ${sum.rhr} bpm, sleep ${sum.sleepHours}h, yesterday's strain ${sum.strain}.
+Planned session: ${JSON.stringify(dy)}
+
+Rules:
+- Recovery under 34% (red): cut loads 20-30%, drop roughly one set per exercise, and swap the most CNS-taxing lifts (heavy squats/deadlifts) for gentler variants.
+- Recovery 34-66% (yellow): trim loads about 10% and reduce total sets slightly. Keep the session's structure.
+- Keep the same day name and a similar exercise count. Use ONLY the available equipment.
+
+Respond ONLY with valid JSON, no markdown fences:
+{"day":"${dy.day}","rest":false,"focus":"session title","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
+
+    const text = await callClaude(prompt, 1200);
+    const adj = JSON.parse(text.replace(/```json|```/g, "").trim());
+    data.plan.originalDay = { idx, day: dy };
+    data.plan.week[idx] = {
+      day: adj.day || dy.day, rest: false,
+      focus: adj.focus || dy.focus, exercises: adj.exercises || dy.exercises,
+    };
+    data.plan.adjustedDate = today;
+    data.plan.adjustNote = adj.adjust_note || "Adjusted to today's recovery.";
+    data.plan.adjustRecovery = sum.recovery;
+    delete data.plan.adjustUndone;
+    writeJson("forge.json", data);
+    console.log(`[auto-adjust] ${today}: ${dy.day} adjusted for recovery ${sum.recovery}%`);
+  } catch (e) {
+    console.error("[auto-adjust] failed:", String(e.message || e));
+  }
+}
+setInterval(autoAdjustCheck, 30 * 60 * 1000);
+setTimeout(autoAdjustCheck, 20 * 1000); // and shortly after boot
 
 /* ---- serve the built frontend ---- */
 app.use(express.static(path.join(__dirname, "dist")));
