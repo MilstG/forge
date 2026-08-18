@@ -28,7 +28,7 @@ const writeJson = (f, data) => {
    (HTTP headers can't carry non-ASCII, e.g. accented characters).
    Values are trimmed because env vars often pick up stray whitespace. */
 const PASSWORD = (process.env.APP_PASSWORD || "").trim();
-const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag"]);
+const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth"]);
 const tokenMatches = (raw) => {
   if (!PASSWORD) return true;
   if (!raw) return false;
@@ -54,8 +54,19 @@ const whoopConfigured = () => !!(process.env.WHOOP_CLIENT_ID && process.env.WHOO
 const appUrl = (req) => (process.env.APP_URL || `https://${req.headers.host}`).replace(/\/$/, "");
 let whoopCache = { at: 0, data: null };
 
-/* Header-authenticated: returns the WHOOP authorize URL for the app to
-   navigate to. Keeps the app password out of URLs entirely. */
+/* Legacy route from an older frontend. If this is reached, the browser is
+   running a stale bundle — the current app POSTs to /whoop/auth-url instead. */
+app.get("/api/whoop/auth", (req, res) => {
+  res.status(409).type("html").send(`<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0B0C0F;color:#EDEEF0;font:15px/1.6 system-ui;padding:28px;max-width:560px;margin:0 auto">
+<h2 style="color:#FF5F2E;margin:0 0 12px">Stale app version</h2>
+<p>This connect link belongs to an older build of the app. The server is up to date, but your browser is running the previous frontend.</p>
+<p><b>Fix:</b> make sure <code style="color:#63A0FF">src/App.jsx</code> is committed and deployed alongside <code style="color:#63A0FF">server.js</code>, then hard-reload this site (long-press reload &rarr; Empty cache, or open in a private window).</p>
+<p style="color:#8B9099;font-size:13px">Your data and WHOOP config are unaffected.</p>
+<p><a href="/" style="color:#FF5F2E">&larr; Back to Forge</a></p>
+</body>`);
+});
 app.post("/api/whoop/auth-url", (req, res) => {
   if (!whoopConfigured()) {
     return res.status(400).json({ error: "WHOOP_CLIENT_ID / WHOOP_CLIENT_SECRET are not set on the server." });
