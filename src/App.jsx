@@ -1,27 +1,47 @@
 import { useState, useEffect, useRef } from "react";
 
-/* ================= design tokens ================= */
+/* ================= design tokens =================
+   Direction: machinist's instrument panel. Warm near-black surfaces,
+   ember accent, hairline rules. Three type roles — condensed display
+   for headings, grotesk for prose, mono for every number. */
 const T = {
-  bg: "#101318",
-  surface: "#1A1F26",
-  surface2: "#232A34",
-  line: "#2D3542",
-  text: "#F2F4F7",
-  sub: "#98A2B3",
-  accent: "#FF6A3D",
-  accentDim: "rgba(255,106,61,0.14)",
-  good: "#5BD68F",
-  goodDim: "rgba(91,214,143,0.14)",
-  blue: "#6AA6FF",
-  blueDim: "rgba(106,166,255,0.14)",
-  gold: "#F5C04E",
-  red: "#FF8A7A",
+  bg: "#0B0C0F",
+  surface: "#141619",
+  surface2: "#1B1E23",
+  raised: "#22262C",
+  line: "#25292F",
+  lineSoft: "rgba(255,255,255,0.06)",
+  text: "#EDEEF0",
+  sub: "#8B9099",
+  dim: "#5E636B",
+  accent: "#FF5F2E",
+  accentDim: "rgba(255,95,46,0.12)",
+  accentGlow: "rgba(255,95,46,0.28)",
+  good: "#3FD69A",
+  goodDim: "rgba(63,214,154,0.10)",
+  blue: "#63A0FF",
+  blueDim: "rgba(99,160,255,0.10)",
+  gold: "#F2B437",
+  goldDim: "rgba(242,180,55,0.10)",
+  red: "#FF6B5A",
+  redDim: "rgba(255,107,90,0.10)",
 };
+
+const FD = "'Saira Condensed','Arial Narrow',Impact,sans-serif";  // display
+const FB = "'Inter',system-ui,-apple-system,'Segoe UI',sans-serif"; // body
+const FM = "'JetBrains Mono','SFMono-Regular',Menlo,monospace";     // numerals
+
 const display = {
-  fontFamily: "'Arial Narrow','Helvetica Neue',Arial,sans-serif",
+  fontFamily: FD,
   textTransform: "uppercase",
-  letterSpacing: "0.03em",
-  fontWeight: 800,
+  letterSpacing: "0.015em",
+  fontWeight: 700,
+  lineHeight: 1.05,
+};
+const mono = {
+  fontFamily: FM,
+  fontVariantNumeric: "tabular-nums",
+  fontFeatureSettings: "'tnum' 1",
 };
 
 /* ================= pictograms ================= */
@@ -179,6 +199,8 @@ export default function Forge() {
   const [swapBusy, setSwapBusy] = useState(null);
   const [swapNote, setSwapNote] = useState("");
   const [addInj, setAddInj] = useState("");
+  const [adjBusy, setAdjBusy] = useState(false);
+  const autoAdj = useRef(false);
   const [loaded, setLoaded] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
   const [pw, setPw] = useState("");
@@ -746,6 +768,66 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
     setWhoopConn(false); setWhoop(null);
   };
 
+  /* ----- daily auto-adjust to recovery ----- */
+  const adjustToday = async (w = whoop) => {
+    if (!plan || !plan.week || !w || w.recovery == null) return;
+    const dy = plan.week[todayIdx];
+    if (!dy || dy.rest || !dy.exercises || !dy.exercises.length) return;
+    setAdjBusy(true);
+    const gearLabels = profile.gear.length ? profile.gear.map((g) => (GEAR.find(([k]) => k === g) || [g, g])[1]) : ["Bodyweight only"];
+    const prompt = `Adjust today's planned training session to the athlete's recovery. Change only what recovery demands.
+
+Athlete: ${profile.level}, goal ${profile.goal}.${(profile.injuries || []).length ? ` Injuries: ${profile.injuries.join("; ")}.` : ""}
+Equipment: ${gearLabels.join(", ")}.
+WHOOP today: recovery ${w.recovery}%, HRV ${w.hrv} ms, RHR ${w.rhr} bpm, sleep ${w.sleepHours}h, yesterday's strain ${w.strain}.
+Planned session: ${JSON.stringify(dy)}
+
+Rules:
+- Recovery under 34% (red): cut loads 20-30%, drop roughly one set per exercise, and swap the most CNS-taxing lifts (heavy squats/deadlifts) for gentler variants.
+- Recovery 34-66% (yellow): trim loads about 10% and reduce total sets slightly. Keep the session's structure.
+- Keep the same day name and a similar exercise count. Use ONLY the available equipment.
+
+Respond ONLY with valid JSON, no markdown fences:
+{"day":"${dy.day}","rest":false,"focus":"session title","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
+    try {
+      const clean = await askClaude(prompt, 1200);
+      const adj = JSON.parse(clean);
+      const np = JSON.parse(JSON.stringify(plan));
+      np.originalDay = { idx: todayIdx, day: dy };
+      np.week[todayIdx] = { day: adj.day || dy.day, rest: false, focus: adj.focus || dy.focus, exercises: adj.exercises || dy.exercises };
+      np.adjustedDate = todayStr;
+      np.adjustNote = adj.adjust_note || "Adjusted to today's recovery.";
+      np.adjustRecovery = w.recovery;
+      setPlan(np);
+      persist({ plan: np });
+      setOpenDay(todayIdx);
+    } catch (e) { /* leave plan untouched on failure */ }
+    setAdjBusy(false);
+  };
+
+  const undoAdjust = () => {
+    if (!plan || !plan.originalDay) return;
+    const np = JSON.parse(JSON.stringify(plan));
+    np.week[np.originalDay.idx] = np.originalDay.day;
+    delete np.originalDay; delete np.adjustNote; delete np.adjustRecovery;
+    np.adjustedDate = todayStr; // don't re-adjust again today after an undo
+    np.adjustUndone = true;
+    setPlan(np);
+    persist({ plan: np });
+  };
+
+  useEffect(() => {
+    if (!loaded || !profile || !plan || !whoop || autoAdj.current) return;
+    if (whoop.recovery == null || whoop.recovery >= 67) return;      // green: train as planned
+    if (plan.adjustedDate === todayStr) return;                       // already handled today
+    if (live || planBusy) return;                                     // never mid-session or mid-build
+    const dy = plan.week && plan.week[todayIdx];
+    if (!dy || dy.rest) return;
+    autoAdj.current = true;
+    adjustToday(whoop);
+    // eslint-disable-next-line
+  }, [loaded, profile, plan, whoop]);
+
   /* ----- exercise info ----- */
   const openExercise = async (name) => {
     const key = name.trim().toLowerCase();
@@ -822,99 +904,158 @@ Respond ONLY with valid JSON, no markdown fences:
     page: {
       height: "100vh", background: T.bg, color: T.text,
       display: "flex", flexDirection: "column", overflow: "hidden", position: "relative",
-      fontFamily: "system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+      fontFamily: FB, letterSpacing: "-0.005em",
     },
-    scroll: { flex: 1, overflowY: "auto", WebkitOverflowScrolling: "touch", paddingTop: 14, paddingBottom: 24 },
-    shell: { maxWidth: 700, margin: "0 auto", padding: "0 14px" },
-    card: { background: T.surface, border: `1px solid ${T.line}`, borderRadius: 14, padding: 16, marginBottom: 12 },
-    h: (size = 18) => ({ ...display, fontSize: size, marginBottom: 10 }),
-    label: { fontSize: 11, color: T.sub, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700, marginBottom: 6, display: "block" },
+    scroll: { flex: 1, overflowY: "auto", WebkitOverflowScrolling: "touch", paddingTop: 16, paddingBottom: 28 },
+    shell: { maxWidth: 660, margin: "0 auto", padding: "0 16px" },
+    card: {
+      background: T.surface, border: `1px solid ${T.line}`, borderRadius: 12,
+      padding: 18, marginBottom: 12,
+    },
+    // flush panel: no border, just a rule at the top — used for grouped sections
+    h: (size = 17) => ({ ...display, fontSize: size, marginBottom: 12 }),
+    label: {
+      fontSize: 10, color: T.dim, textTransform: "uppercase", letterSpacing: "0.14em",
+      fontWeight: 600, marginBottom: 7, display: "block", fontFamily: FB,
+    },
+    num: (size = 15, color) => ({ ...mono, fontSize: size, fontWeight: 500, color: color || T.text, letterSpacing: "-0.02em" }),
     input: {
-      width: "100%", boxSizing: "border-box", padding: "11px 12px", borderRadius: 10,
-      border: `1px solid ${T.line}`, background: T.surface2, color: T.text, fontSize: 15, outline: "none",
+      width: "100%", boxSizing: "border-box", padding: "11px 13px", borderRadius: 9,
+      border: `1px solid ${T.line}`, background: T.bg, color: T.text, fontSize: 15,
+      outline: "none", fontFamily: FB,
+    },
+    inputNum: {
+      width: "100%", boxSizing: "border-box", padding: "11px 12px", borderRadius: 9,
+      border: `1px solid ${T.line}`, background: T.bg, color: T.text, fontSize: 15,
+      outline: "none", ...mono, textAlign: "center",
     },
     btn: {
-      background: T.accent, color: "#17110E", border: "none", borderRadius: 10,
-      padding: "13px 18px", fontSize: 15, fontWeight: 800, cursor: "pointer", width: "100%",
+      background: T.accent, color: "#150A05", border: "none", borderRadius: 9,
+      padding: "14px 18px", fontSize: 13, cursor: "pointer", width: "100%",
+      fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700,
+      boxShadow: `0 0 0 1px ${T.accent}, 0 6px 22px -8px ${T.accentGlow}`,
     },
     ghost: {
-      background: "transparent", color: T.accent, border: `1.5px solid ${T.accent}`,
-      borderRadius: 10, padding: "10px 14px", fontSize: 14, fontWeight: 700, cursor: "pointer",
+      background: "transparent", color: T.text, border: `1px solid ${T.line}`,
+      borderRadius: 9, padding: "11px 15px", fontSize: 12, cursor: "pointer",
+      fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600,
     },
     chip: (on) => ({
-      padding: "8px 13px", borderRadius: 999, fontSize: 13.5, fontWeight: 650, cursor: "pointer",
-      border: `1.5px solid ${on ? T.accent : T.line}`,
-      background: on ? T.accentDim : T.surface2, color: on ? T.accent : T.text,
+      padding: "9px 14px", borderRadius: 7, fontSize: 13.5, fontWeight: 500, cursor: "pointer",
+      fontFamily: FB, transition: "none",
+      border: `1px solid ${on ? T.accent : T.line}`,
+      background: on ? T.accentDim : "transparent", color: on ? T.accent : T.sub,
     }),
-    tile: { background: T.surface, border: `1px solid ${T.line}`, borderRadius: 14, padding: "12px 14px" },
-    tileNum: { ...display, fontSize: 24, lineHeight: 1.05 },
-    tileLab: { fontSize: 10.5, color: T.sub, textTransform: "uppercase", letterSpacing: "0.07em", fontWeight: 700, marginTop: 3 },
+    tile: { background: T.surface, border: `1px solid ${T.line}`, borderRadius: 12, padding: "13px 14px" },
+    tileNum: { ...mono, fontSize: 21, fontWeight: 500, letterSpacing: "-0.03em", lineHeight: 1.1 },
+    tileLab: { fontSize: 9.5, color: T.dim, textTransform: "uppercase", letterSpacing: "0.13em", fontWeight: 600, marginTop: 5 },
   };
 
-  const Ring = ({ pct, size = 56 }) => {
-    const r = (size - 8) / 2, c = 2 * Math.PI * r;
+  /* ----- primitives ----- */
+  // Section header with a ruled line and tick — the recurring structural device
+  const Rule = ({ label, right, color = T.dim }) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 13 }}>
+      <span style={{ width: 2, height: 11, background: color === T.dim ? T.accent : color, flexShrink: 0 }} />
+      <span style={{ fontSize: 10, color, textTransform: "uppercase", letterSpacing: "0.16em", fontWeight: 600, whiteSpace: "nowrap" }}>
+        {label}
+      </span>
+      <span style={{ flex: 1, height: 1, background: T.lineSoft }} />
+      {right && <span style={{ ...mono, fontSize: 11, color: T.dim, whiteSpace: "nowrap" }}>{right}</span>}
+    </div>
+  );
+
+  const Row = ({ children, last, onClick, style }) => (
+    <div onClick={onClick} style={{
+      display: "flex", alignItems: "center", gap: 12, padding: "11px 0",
+      borderBottom: last ? "none" : `1px solid ${T.lineSoft}`,
+      cursor: onClick ? "pointer" : "default", ...style,
+    }}>{children}</div>
+  );
+
+  const Ring = ({ pct, size = 46 }) => {
+    const r = (size - 5) / 2, c = 2 * Math.PI * r;
     return (
-      <svg width={size} height={size}>
-        <circle cx={size / 2} cy={size / 2} r={r} stroke={T.line} strokeWidth="6" fill="none" />
-        <circle cx={size / 2} cy={size / 2} r={r} stroke={T.accent} strokeWidth="6" fill="none"
-          strokeDasharray={c} strokeDashoffset={c * (1 - pct)} strokeLinecap="round"
+      <svg width={size} height={size} style={{ flexShrink: 0 }}>
+        <circle cx={size / 2} cy={size / 2} r={r} stroke={T.line} strokeWidth="2.5" fill="none" />
+        <circle cx={size / 2} cy={size / 2} r={r} stroke={T.accent} strokeWidth="2.5" fill="none"
+          strokeDasharray={c} strokeDashoffset={c * (1 - pct)} strokeLinecap="butt"
           transform={`rotate(-90 ${size / 2} ${size / 2})`} />
-        <text x="50%" y="54%" textAnchor="middle" dominantBaseline="middle"
-          fill={T.text} fontSize={size / 3.4} fontWeight="800"
-          fontFamily="'Arial Narrow',Arial,sans-serif">{level}</text>
+        <text x="50%" y="53%" textAnchor="middle" dominantBaseline="middle"
+          fill={T.text} fontSize={size / 2.9} fontWeight="500"
+          fontFamily={FM}>{level}</text>
       </svg>
     );
   };
 
-  const ExIcon = ({ name, size = 44, color = T.blue, icon }) => (
+  const ExIcon = ({ name, size = 42, color = T.sub, icon }) => (
     <div style={{
       width: size, height: size, flexShrink: 0, color,
-      background: T.surface2, border: `1px solid ${T.line}`, borderRadius: 10, padding: 6, boxSizing: "border-box",
+      background: T.bg, border: `1px solid ${T.line}`, borderRadius: 9,
+      padding: size > 34 ? 7 : 5, boxSizing: "border-box",
     }}>{icon || iconFor(name)}</div>
   );
 
   const Header = () => (
-    <div style={{ background: "linear-gradient(180deg,#161B22 0%,#101318 100%)", borderBottom: `1px solid ${T.line}`, padding: "16px 14px 12px", flexShrink: 0 }}>
-      <div style={{ maxWidth: 700, margin: "0 auto", display: "flex", alignItems: "center", gap: 14 }}>
+    <div style={{
+      background: T.surface, borderBottom: `1px solid ${T.line}`,
+      padding: "13px 16px 12px", flexShrink: 0,
+    }}>
+      <div style={{ maxWidth: 660, margin: "0 auto", display: "flex", alignItems: "center", gap: 13 }}>
         <Ring pct={lvPct} />
-        <div style={{ flex: 1 }}>
-          <div style={{ ...display, fontSize: 24, lineHeight: 1 }}>Forge</div>
-          <div style={{ color: T.sub, fontSize: 12.5, marginTop: 4 }}>
-            Level {level} · {xp - lvFloor}/{lvNext - lvFloor} XP to next
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ ...display, fontSize: 22, letterSpacing: "0.08em" }}>
+            Forge<span style={{ color: T.accent }}>.</span>
+          </div>
+          <div style={{ fontSize: 11, color: T.dim, marginTop: 3, ...mono }}>
+            LV{level} · {xp - lvFloor}/{lvNext - lvFloor} XP
           </div>
         </div>
-        <div style={{ textAlign: "right" }}>
-          <div style={{ ...display, fontSize: 22, color: streak > 0 ? T.gold : T.sub, opacity: streak > 0 ? 1 : 0.6, whiteSpace: "nowrap" }}>
-            🔥 {streak}
+        {profile && (
+          <div style={{ display: "flex", gap: 18, alignItems: "flex-start" }}>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ ...mono, fontSize: 17, color: T.text }}>
+                {thisWeek}<span style={{ color: T.dim, fontSize: 13 }}>/{profile.days}</span>
+              </div>
+              <div style={{ fontSize: 9, color: T.dim, textTransform: "uppercase", letterSpacing: "0.12em", marginTop: 3 }}>week</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ ...mono, fontSize: 17, color: streak > 0 ? T.gold : T.dim }}>
+                {streak}
+              </div>
+              <div style={{ fontSize: 9, color: T.dim, textTransform: "uppercase", letterSpacing: "0.12em", marginTop: 3 }}>streak</div>
+            </div>
           </div>
-          <div style={{ fontSize: 11, color: T.sub, textTransform: "uppercase", letterSpacing: "0.06em" }}>week streak</div>
-        </div>
+        )}
       </div>
       {profile && (
-        <div style={{ maxWidth: 700, margin: "10px auto 0", display: "flex", gap: 6, alignItems: "center" }}>
+        <div style={{ maxWidth: 660, margin: "11px auto 0", display: "flex", gap: 3 }}>
           {Array.from({ length: profile.days }).map((_, i) => (
-            <div key={i} style={{ flex: 1, height: 6, borderRadius: 3, background: i < thisWeek ? T.good : T.line }} />
+            <div key={i} style={{
+              flex: 1, height: 3,
+              background: i < thisWeek ? T.accent : T.line,
+              boxShadow: i < thisWeek ? `0 0 8px -1px ${T.accentGlow}` : "none",
+            }} />
           ))}
-          <span style={{ fontSize: 11, color: T.sub, marginLeft: 6, whiteSpace: "nowrap" }}>{thisWeek}/{profile.days} this week</span>
         </div>
       )}
     </div>
   );
 
   const Tabs = () => (
-    <div style={{
-      flexShrink: 0, zIndex: 10,
-      background: "#141821", borderTop: `1px solid ${T.line}`,
-    }}>
-      <div style={{ maxWidth: 700, margin: "0 auto", display: "flex" }}>
-        {[["coach", "Plan"], ["log", "Log"], ["history", "History"], ["stats", "Stats"], ["profile", "You"]].map(([k, l]) => (
-          <button key={k} onClick={() => setTab(k)} style={{
-            flex: 1, padding: "13px 0 15px", background: "none", border: "none", cursor: "pointer",
-            color: tab === k ? T.accent : T.sub, fontWeight: 800, fontSize: 13,
-            borderTop: `2.5px solid ${tab === k ? T.accent : "transparent"}`,
-            textTransform: "uppercase", letterSpacing: "0.05em",
-          }}>{l}</button>
-        ))}
+    <div style={{ flexShrink: 0, zIndex: 10, background: T.surface, borderTop: `1px solid ${T.line}` }}>
+      <div style={{ maxWidth: 660, margin: "0 auto", display: "flex" }}>
+        {[["coach", "Plan"], ["log", "Log"], ["history", "Log book"], ["stats", "Stats"], ["profile", "You"]].map(([k, l]) => {
+          const on = tab === k;
+          return (
+            <button key={k} onClick={() => setTab(k)} style={{
+              flex: 1, padding: "14px 0 16px", background: "none", border: "none", cursor: "pointer",
+              color: on ? T.accent : T.dim,
+              fontFamily: FD, fontWeight: on ? 700 : 500, fontSize: 12,
+              textTransform: "uppercase", letterSpacing: "0.11em",
+              boxShadow: on ? `inset 0 2px 0 ${T.accent}` : "none",
+            }}>{l}</button>
+          );
+        })}
       </div>
     </div>
   );
@@ -936,7 +1077,7 @@ Respond ONLY with valid JSON, no markdown fences:
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
             <ExIcon name={modal.name} size={52} color={T.accent} />
             <div style={{ flex: 1 }}>
-              <div style={{ ...display, fontSize: 22, lineHeight: 1.1 }}>{modal.name}</div>
+              <div style={{ ...display, fontSize: 25 }}>{modal.name}</div>
               <div style={{ fontSize: 12.5, color: T.sub }}>{groupFor(modal.name)}</div>
             </div>
             <button onClick={() => setModal(null)} style={{
@@ -977,11 +1118,11 @@ Respond ONLY with valid JSON, no markdown fences:
                 </div>
               )}
               <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
-                <div style={{ flex: 1, minWidth: 220, background: T.goodDim, borderRadius: 10, padding: 12 }}>
+                <div style={{ flex: 1, minWidth: 210, background: T.goodDim, borderRadius: 9, padding: 13, borderLeft: `2px solid ${T.good}` }}>
                   <div style={{ ...S.label, color: T.good }}>Do</div>
                   {(info.dos || []).map((x, i) => <div key={i} style={{ fontSize: 13.5, marginBottom: 4 }}>✓ {x}</div>)}
                 </div>
-                <div style={{ flex: 1, minWidth: 220, background: "rgba(255,138,122,0.1)", borderRadius: 10, padding: 12 }}>
+                <div style={{ flex: 1, minWidth: 210, background: T.redDim, borderRadius: 9, padding: 13, borderLeft: `2px solid ${T.red}` }}>
                   <div style={{ ...S.label, color: T.red }}>Don't</div>
                   {(info.donts || []).map((x, i) => <div key={i} style={{ fontSize: 13.5, marginBottom: 4 }}>✕ {x}</div>)}
                 </div>
@@ -1004,7 +1145,7 @@ Respond ONLY with valid JSON, no markdown fences:
       <div style={S.page}>
         <div style={{ ...S.scroll, display: "flex", alignItems: "center", justifyContent: "center" }}>
           <div style={{ ...S.card, width: 300 }}>
-            <div style={{ ...display, fontSize: 26, marginBottom: 4 }}>Forge</div>
+            <div style={{ ...display, fontSize: 30, marginBottom: 6, letterSpacing: "0.06em" }}>Forge<span style={{ color: T.accent }}>.</span></div>
             <p style={{ color: T.sub, fontSize: 13, marginTop: 0 }}>This app is password-protected.</p>
             <span style={S.label}>Password</span>
             <input type="password" autoFocus value={pw}
@@ -1028,14 +1169,14 @@ Respond ONLY with valid JSON, no markdown fences:
         <div style={S.shell}>
           {!profile && (
             <div style={{ padding: "26px 2px 6px" }}>
-              <div style={{ ...display, fontSize: 34, lineHeight: 1 }}>Forge</div>
+              <div style={{ ...display, fontSize: 40, letterSpacing: "0.06em" }}>Forge<span style={{ color: T.accent }}>.</span></div>
               <p style={{ color: T.sub, fontSize: 14, marginTop: 8 }}>
                 Tell your coach about yourself. You'll get a full weekly plan right after.
               </p>
             </div>
           )}
           <div style={S.card}>
-            <div style={S.h()}>About you</div>
+            <Rule label="About you" />
             <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
               {[["age", "Age", "34"], ["height", "Height (cm)", "176"], ["weight", "Weight (kg)", "78"]].map(([k, l, ph]) => (
                 <div key={k} style={{ flex: 1 }}>
@@ -1050,7 +1191,7 @@ Respond ONLY with valid JSON, no markdown fences:
             </div>
           </div>
           <div style={S.card}>
-            <div style={S.h()}>Your goals</div>
+            <Rule label="Your goals" />
             <span style={S.label}>Main goal</span>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
               {GOALS.map((g) => <button key={g} style={S.chip(d.goal === g)} onClick={() => setDF("goal", g)}>{g}</button>)}
@@ -1061,7 +1202,7 @@ Respond ONLY with valid JSON, no markdown fences:
               value={d.specific} onChange={(e) => setDF("specific", e.target.value)} />
           </div>
           <div style={S.card}>
-            <div style={S.h()}>Training setup</div>
+            <Rule label="Training setup" />
             <span style={S.label}>Experience</span>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
               {LEVELS.map((l) => <button key={l} style={S.chip(d.level === l)} onClick={() => setDF("level", l)}>{l}</button>)}
@@ -1082,7 +1223,7 @@ Respond ONLY with valid JSON, no markdown fences:
             </div>
           </div>
           <div style={S.card}>
-            <div style={S.h()}>Injuries & limitations</div>
+            <Rule label="Injuries & limitations" />
             {(d.injuries || []).length > 0 && (
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
                 {(d.injuries || []).map((inj) => (
@@ -1111,7 +1252,7 @@ Respond ONLY with valid JSON, no markdown fences:
           {profile && (
             <div style={S.card}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <div style={S.h()}>WHOOP</div>
+                <Rule label="WHOOP" />
                 {whoopConn && <span style={{ fontSize: 12, color: T.good, fontWeight: 700 }}>● connected</span>}
               </div>
               {!whoopConn ? (
@@ -1149,7 +1290,7 @@ Respond ONLY with valid JSON, no markdown fences:
 
           {profile && (
             <div style={S.card}>
-              <div style={S.h()}>Backup & export</div>
+              <Rule label="Backup & export" />
               <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
                 <button style={{ ...S.ghost, flex: 1 }} onClick={exportJson}>Download JSON</button>
                 <button style={{ ...S.ghost, flex: 1 }} onClick={exportCsv}>Download CSV</button>
@@ -1207,7 +1348,7 @@ Respond ONLY with valid JSON, no markdown fences:
             )}
 
             {fatigueAlert && !planBusy && (
-              <div style={{ ...S.card, background: "rgba(245,192,78,0.08)", borderColor: T.gold }}>
+              <div style={{ ...S.card, background: T.goldDim, borderColor: T.line, borderLeft: `2px solid ${T.gold}` }}>
                 <div style={{ fontSize: 13.5, lineHeight: 1.5 }}>
                   <b style={{ color: T.gold }}>Fatigue check · </b>
                   {volRising && "Your volume has climbed 4 weeks straight. "}
@@ -1239,10 +1380,35 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             )}
 
+            {adjBusy && (
+              <div style={{ ...S.card, borderColor: T.gold }}>
+                <span style={{ fontSize: 13.5 }}>
+                  <b style={{ color: T.gold }}>⚡ Recovery is {whoop && whoop.recovery}% · </b>
+                  adjusting today's session…
+                </span>
+              </div>
+            )}
+            {!adjBusy && plan && plan.adjustedDate === todayStr && plan.adjustNote && !plan.adjustUndone && (
+              <div style={{ ...S.card, background: T.goldDim, borderColor: T.line, borderLeft: `2px solid ${T.gold}` }}>
+                <div style={{ fontSize: 13.5, lineHeight: 1.5 }}>
+                  <b style={{ color: T.gold }}>⚡ Today auto-adjusted for {plan.adjustRecovery}% recovery · </b>
+                  {plan.adjustNote}
+                </div>
+                {plan.originalDay && (
+                  <button onClick={undoAdjust} style={{
+                    background: "none", border: "none", color: T.sub, fontSize: 12.5,
+                    fontWeight: 700, cursor: "pointer", padding: "8px 0 0", textDecoration: "underline",
+                  }}>
+                    Feeling strong? Undo — restore the original session
+                  </button>
+                )}
+              </div>
+            )}
+
             {block ? (
               <div style={S.card}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                  <div style={S.h(15)}>Block · {block.name}</div>
+                  <Rule label={`Block · ${block.name}`} />
                   <button onClick={() => { if (window.confirm("End this training block?")) endBlock(); }}
                     style={{ background: "none", border: "none", color: T.sub, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
                     End block
@@ -1269,7 +1435,7 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             ) : (
               <div style={S.card}>
-                <div style={S.h(15)}>Train in a block</div>
+                <Rule label="Train in a block" />
                 <p style={{ color: T.sub, fontSize: 13, marginTop: 0 }}>
                   A structured multi-week program: planned progression, a built-in deload, and a peak week aimed at your goals.
                 </p>
@@ -1298,35 +1464,90 @@ Respond ONLY with valid JSON, no markdown fences:
             )}
             {plan && !planBusy && (
               <>
-                <div style={{ ...S.card, borderColor: T.accent, borderWidth: 1.5 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                    <div style={{ fontSize: 11, color: T.accent, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 800 }}>
-                      Your week
+                {(() => {
+                  const td = plan.week && plan.week[todayIdx];
+                  const trained = doneDays.has(todayIdx);
+                  return (
+                    <div style={{
+                      ...S.card, padding: 0, overflow: "hidden",
+                      borderColor: trained ? T.line : td && !td.rest ? T.accent : T.line,
+                    }}>
+                      <div style={{ padding: "16px 18px 15px", background: td && !td.rest && !trained ? T.accentDim : "transparent" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                          <span style={{ fontSize: 10, color: T.dim, textTransform: "uppercase", letterSpacing: "0.16em", fontWeight: 600 }}>
+                            Today · {DAYS[todayIdx]}
+                          </span>
+                          <span style={{ ...mono, fontSize: 10.5, color: T.dim }}>{todayStr}</span>
+                        </div>
+                        <div style={{ ...display, fontSize: 30, marginTop: 7, color: td && td.rest ? T.sub : T.text }}>
+                          {trained ? "Session complete" : td ? (td.rest ? "Rest day" : td.focus) : "No plan yet"}
+                        </div>
+                        {td && !td.rest && !trained && (
+                          <div style={{ ...mono, fontSize: 12, color: T.sub, marginTop: 6 }}>
+                            {td.exercises.length} exercises · {td.exercises.reduce((s, e) => s + (+e.sets || 0), 0)} sets
+                          </div>
+                        )}
+                        {td && td.rest && (
+                          <div style={{ fontSize: 13.5, color: T.sub, marginTop: 6, lineHeight: 1.5 }}>{td.note || "Recovery day."}</div>
+                        )}
+                        {trained && (
+                          <div style={{ fontSize: 13, color: T.good, marginTop: 6 }}>✓ Logged. Well done.</div>
+                        )}
+                      </div>
+                      {td && !td.rest && !trained && (
+                        <div style={{ display: "flex", borderTop: `1px solid ${T.line}` }}>
+                          <button onClick={() => startLive(td)} style={{
+                            flex: 1, padding: "15px 0", background: T.accent, color: "#150A05", border: "none",
+                            cursor: "pointer", fontFamily: FD, textTransform: "uppercase",
+                            letterSpacing: "0.11em", fontWeight: 700, fontSize: 13,
+                          }}>
+                            Start session
+                          </button>
+                          <button onClick={() => setOpenDay(todayIdx)} style={{
+                            padding: "15px 20px", background: "transparent", color: T.sub, border: "none",
+                            borderLeft: `1px solid ${T.line}`, cursor: "pointer", fontFamily: FD,
+                            textTransform: "uppercase", letterSpacing: "0.11em", fontWeight: 600, fontSize: 12,
+                          }}>
+                            View
+                          </button>
+                        </div>
+                      )}
                     </div>
-                    <span style={{ fontSize: 11.5, color: T.sub }}>built {plan.created}</span>
-                  </div>
-                  <div style={{ fontSize: 14, color: T.sub, lineHeight: 1.5, marginTop: 8 }}>{plan.why}</div>
+                  );
+                })()}
+
+                <div style={S.card}>
+                  <Rule label="The week" right={`built ${plan.created}`} />
+                  <div style={{ fontSize: 13.5, color: T.sub, lineHeight: 1.6 }}>{plan.why}</div>
                 </div>
 
                 {/* day strip */}
-                <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
                   {(plan.week || []).map((dy, i) => {
                     const isToday = i === todayIdx;
                     const open = openDay === i;
+                    const done = doneDays.has(i);
+                    const missed = !dy.rest && i < todayIdx && !done;
                     return (
                       <button key={i} onClick={() => setOpenDay(open ? null : i)} style={{
-                        flex: 1, padding: "9px 0 7px", borderRadius: 10, cursor: "pointer",
-                        border: `1.5px solid ${open ? T.accent : isToday ? T.blue : T.line}`,
+                        flex: 1, padding: "10px 0 8px", borderRadius: 9, cursor: "pointer",
+                        border: `1px solid ${open ? T.accent : T.line}`,
                         background: open ? T.accentDim : T.surface,
-                        color: dy.rest ? T.sub : T.text,
+                        boxShadow: isToday && !open ? `inset 0 -2px 0 ${T.blue}` : "none",
                       }}>
-                        <div style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase", color: isToday ? T.blue : T.sub }}>{dy.day}</div>
-                        <div style={{ width: 28, height: 28, margin: "5px auto 0", color: dy.rest ? T.sub : T.accent }}>
+                        <div style={{
+                          ...mono, fontSize: 9.5, letterSpacing: "0.06em",
+                          color: isToday ? T.blue : T.dim, textTransform: "uppercase",
+                        }}>{dy.day}</div>
+                        <div style={{
+                          width: 26, height: 26, margin: "6px auto 0",
+                          color: dy.rest ? T.dim : open ? T.accent : T.sub, opacity: dy.rest ? 0.5 : 1,
+                        }}>
                           {dy.rest ? ICONS.rest : iconFor((dy.exercises || [{}])[0].exercise)}
                         </div>
                         <div style={{
-                          width: 5, height: 5, borderRadius: 3, margin: "4px auto 0",
-                          background: doneDays.has(i) ? T.good : (!dy.rest && i < todayIdx ? T.red : "transparent"),
+                          width: 14, height: 2, margin: "7px auto 0",
+                          background: done ? T.good : missed ? T.red : "transparent",
                         }} />
                       </button>
                     );
@@ -1339,8 +1560,8 @@ Respond ONLY with valid JSON, no markdown fences:
                   return (
                     <div style={S.card}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-                        <div style={{ ...display, fontSize: 22 }}>
-                          {dy.day} — {dy.rest ? "Rest" : dy.focus}
+                        <div style={{ ...display, fontSize: 24 }}>
+                          {dy.rest ? `${dy.day} · Rest` : dy.focus}
                         </div>
                         {openDay === todayIdx && <span style={{ fontSize: 11, color: T.blue, fontWeight: 800, textTransform: "uppercase" }}>Today</span>}
                       </div>
@@ -1374,7 +1595,7 @@ Respond ONLY with valid JSON, no markdown fences:
                                   }}>
                                   {swapBusy === `${openDay}-${i}` ? "…" : "⇄"}
                                 </button>
-                                <div style={{ ...display, fontSize: 18, color: T.blue, whiteSpace: "nowrap" }}>{e.sets}×{e.reps}</div>
+                                <div style={{ ...mono, fontSize: 14, color: T.text, whiteSpace: "nowrap" }}>{e.sets}<span style={{ color: T.dim }}>×</span>{e.reps}</div>
                               </div>
                             );
                           })}
@@ -1394,7 +1615,7 @@ Respond ONLY with valid JSON, no markdown fences:
                 })()}
 
                 {plan.tip && (
-                  <div style={{ ...S.card, background: T.goodDim, borderColor: "transparent" }}>
+                  <div style={{ ...S.card, background: T.goodDim, borderColor: T.line, borderLeft: `2px solid ${T.good}` }}>
                     <b style={{ color: T.good }}>Coach's tip · </b><span style={{ fontSize: 14 }}>{plan.tip}</span>
                   </div>
                 )}
@@ -1421,7 +1642,7 @@ Respond ONLY with valid JSON, no markdown fences:
           return (
             <>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
-                <div style={{ ...display, fontSize: 20 }}>{live.focus || "Live session"}</div>
+                <div style={{ ...display, fontSize: 24 }}>{live.focus || "Live session"}</div>
                 <div style={{ fontSize: 13, color: T.sub }}>{elapsedMin} min · {totalDone} sets done</div>
               </div>
 
@@ -1431,7 +1652,7 @@ Respond ONLY with valid JSON, no markdown fences:
                   background: restLeft > 0 ? T.accentDim : T.goodDim,
                   borderColor: restLeft > 0 ? T.accent : T.good,
                 }}>
-                  <div style={{ ...display, fontSize: 40, color: restLeft > 0 ? T.accent : T.good }}>
+                  <div style={{ ...mono, fontSize: 44, fontWeight: 500, letterSpacing: "-0.04em", color: restLeft > 0 ? T.accent : T.good }}>
                     {restLeft > 0 ? fmtClock(restLeft) : "GO!"}
                   </div>
                   <div style={{ fontSize: 12, color: T.sub, marginBottom: 10 }}>
@@ -1490,13 +1711,13 @@ Respond ONLY with valid JSON, no markdown fences:
                     display: "flex", gap: 8, alignItems: "center", padding: "8px 0",
                     borderBottom: `1px solid ${T.line}`, opacity: s.done ? 0.65 : 1,
                   }}>
-                    <span style={{ ...display, width: 22, color: s.done ? T.good : T.sub, fontSize: 15 }}>{si + 1}</span>
+                    <span style={{ ...mono, width: 20, color: s.done ? T.good : T.dim, fontSize: 12 }}>{String(si + 1).padStart(2, "0")}</span>
                     <input inputMode="decimal" placeholder="kg" value={s.weight} disabled={s.done}
                       onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[si].weight = e.target.value; })}
-                      style={{ ...S.input, width: 76, flex: "none", padding: "9px 10px" }} />
+                      style={{ ...S.inputNum, width: 74, flex: "none", padding: "10px 8px" }} />
                     <input inputMode="numeric" placeholder="reps" value={s.reps} disabled={s.done}
                       onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[si].reps = e.target.value; })}
-                      style={{ ...S.input, width: 68, flex: "none", padding: "9px 10px" }} />
+                      style={{ ...S.inputNum, width: 64, flex: "none", padding: "10px 8px" }} />
                     <button
                       onClick={() => {
                         if (s.done) { updLive((nl) => { nl.exercises[nl.idx].sets[si].done = false; }, true); return; }
@@ -1504,8 +1725,8 @@ Respond ONLY with valid JSON, no markdown fences:
                         setRestEnd(Date.now() + restSecs * 1000);
                       }}
                       style={{
-                        flex: 1, padding: "10px 0", borderRadius: 8, cursor: "pointer", fontWeight: 800, fontSize: 14,
-                        border: "none",
+                        flex: 1, padding: "11px 0", borderRadius: 8, cursor: "pointer", fontSize: 11.5,
+                        border: "none", fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.11em", fontWeight: 700,
                         background: s.done ? T.goodDim : T.accent,
                         color: s.done ? T.good : "#17110E",
                       }}>
@@ -1550,12 +1771,12 @@ Respond ONLY with valid JSON, no markdown fences:
         {tab === "log" && (
           <>
             <div style={S.card}>
-              <div style={S.h(20)}>Log a workout</div>
+              <Rule label="Log a workout" />
               <span style={S.label}>Date</span>
               <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
                 style={{ ...S.input, marginBottom: 12, colorScheme: "dark" }} />
               {exs.map((ex, i) => (
-                <div key={i} style={{ background: T.surface2, borderRadius: 12, padding: 12, marginBottom: 10, display: "flex", gap: 10 }}>
+                <div key={i} style={{ background: T.surface2, borderRadius: 10, padding: 13, marginBottom: 9, display: "flex", gap: 11, border: `1px solid ${T.line}` }}>
                   <div onClick={() => ex.name.trim() && openExercise(ex.name)} style={{ cursor: ex.name.trim() ? "pointer" : "default" }}>
                     <ExIcon name={ex.name} size={40} color={T.accent} />
                   </div>
@@ -1568,7 +1789,7 @@ Respond ONLY with valid JSON, no markdown fences:
                         <input key={f} placeholder={f === "weight" ? "kg" : f}
                           inputMode="decimal" value={ex[f]}
                           onChange={(e) => setExs((a) => a.map((x, j) => j === i ? { ...x, [f]: e.target.value } : x))}
-                          style={{ ...S.input, background: T.surface }} />
+                          style={{ ...S.inputNum }} />
                       ))}
                     </div>
                     {(() => {
@@ -1644,7 +1865,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {workouts.map((w) => (
               <div key={w.id} style={S.card}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
-                  <span style={{ ...display, fontSize: 16 }}>{w.date}</span>
+                  <span style={{ ...mono, fontSize: 13.5, color: T.text }}>{w.date}</span>
                   <div style={{ display: "flex", gap: 14, alignItems: "baseline" }}>
                     <span style={{ fontSize: 12, color: T.sub }}>{Math.round(volumeOf(w)).toLocaleString()} vol</span>
                     <button onClick={() => delWorkout(w.id)}
@@ -1674,7 +1895,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* AI coach review */}
             <div style={{ ...S.card, borderColor: T.blue }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <div style={S.h(16)}>Coach's review</div>
+                <Rule label="Coach's review" />
                 {insights && insights.date && <span style={{ fontSize: 11, color: T.sub }}>{insights.date}</span>}
               </div>
               {!insights && !insightsBusy && (
@@ -1731,7 +1952,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* adherence */}
             <div style={S.card}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <div style={S.h(15)}>Plan adherence — last 8 weeks</div>
+                <Rule label="Plan adherence — last 8 weeks" />
                 <span style={{ fontSize: 12.5, color: avgAdherence >= 80 ? T.good : avgAdherence >= 50 ? T.gold : T.red, fontWeight: 800 }}>
                   avg {avgAdherence}%
                 </span>
@@ -1754,7 +1975,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* muscle groups detail */}
             {mList.length > 0 && (
               <div style={S.card}>
-                <div style={S.h(15)}>Muscle groups — last 28 days</div>
+                <Rule label="Muscle groups — last 28 days" />
                 {mList.map(([g, v]) => {
                   const ds = daysSince(v.last);
                   const stale = ds !== null && ds > 10;
@@ -1785,7 +2006,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* balance */}
             {(pushSets + pullSets + lowerSets) > 0 && (
               <div style={S.card}>
-                <div style={S.h(15)}>Balance — last 28 days</div>
+                <Rule label="Balance — last 28 days" />
                 {[
                   ["Push", pushSets, "Pull", pullSets],
                   ["Upper", upperSets, "Lower", lowerSets],
@@ -1804,7 +2025,7 @@ Respond ONLY with valid JSON, no markdown fences:
                   );
                 })}
                 {neglected.length > 0 && (
-                  <div style={{ background: "rgba(255,138,122,0.1)", borderRadius: 10, padding: "10px 12px", fontSize: 13.5 }}>
+                  <div style={{ background: T.redDim, borderRadius: 9, padding: "11px 13px", fontSize: 13, borderLeft: `2px solid ${T.red}` }}>
                     <b style={{ color: T.red }}>Needs attention · </b>
                     {neglected.join(", ")} — over 10 days without work (or never trained).
                   </div>
@@ -1814,7 +2035,7 @@ Respond ONLY with valid JSON, no markdown fences:
 
             {/* weekly volume */}
             <div style={S.card}>
-              <div style={S.h(15)}>Weekly volume — last 8 weeks</div>
+              <Rule label="Weekly volume — last 8 weeks" />
               <div style={{ display: "flex", alignItems: "flex-end", gap: 7, height: 100 }}>
                 {weeks8.map((w) => (
                   <div key={w.k} style={{ flex: 1, textAlign: "center" }}>
@@ -1832,7 +2053,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* progression */}
             {exNames.length > 0 && (
               <div style={S.card}>
-                <div style={S.h(15)}>Exercise progression</div>
+                <Rule label="Exercise progression" />
                 <select value={chosenEx} onChange={(e) => setStatEx(e.target.value)} style={{ ...S.input, marginBottom: 12 }}>
                   {exNames.map((n) => <option key={n}>{n}</option>)}
                 </select>
@@ -1863,7 +2084,7 @@ Respond ONLY with valid JSON, no markdown fences:
 
             {/* body weight */}
             <div style={S.card}>
-              <div style={S.h(15)}>Body weight</div>
+              <Rule label="Body weight" />
               <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
                 <input style={S.input} inputMode="decimal" placeholder="Today's weight (kg)"
                   value={bwInput} onChange={(e) => setBwInput(e.target.value)} />
@@ -1891,7 +2112,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* nutrition */}
             <div style={S.card}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <div style={S.h(15)}>Nutrition</div>
+                <Rule label="Nutrition" />
                 {nut && <span style={{ fontSize: 12, color: T.sub }}>targets: {nut.kcal} kcal · {nut.protein}g protein</span>}
               </div>
               {!nut ? (
@@ -1945,12 +2166,12 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* PRs */}
             {prList.length > 0 && (
               <div style={S.card}>
-                <div style={S.h(15)}>Personal records</div>
+                <Rule label="Personal records" />
                 {prList.slice(0, 8).map((p) => (
                   <div key={p.name} onClick={() => openExercise(p.name)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: `1px solid ${T.line}`, cursor: "pointer" }}>
                     <ExIcon name={p.name} size={30} color={T.gold} />
                     <span style={{ flex: 1, fontSize: 14 }}>{p.name}</span>
-                    <span style={{ color: T.gold, fontWeight: 800 }}>{p.weight} kg</span>
+                    <span style={{ ...mono, color: T.gold, fontSize: 14 }}>{p.weight}<span style={{ color: T.dim, fontSize: 11 }}> kg</span></span>
                     <span style={{ color: T.sub, fontSize: 12 }}>{p.date}</span>
                   </div>
                 ))}
@@ -1959,7 +2180,7 @@ Respond ONLY with valid JSON, no markdown fences:
 
             {/* achievements */}
             <div style={S.card}>
-              <div style={S.h(15)}>Achievements</div>
+              <Rule label="Achievements" />
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
                 {earned.map((b) => (
                   <div key={b.id} style={{
@@ -1990,7 +2211,7 @@ Respond ONLY with valid JSON, no markdown fences:
             boxShadow: "0 0 80px rgba(245,192,78,0.25)",
           }}>
             <div style={{ fontSize: 54, lineHeight: 1 }}>🏆</div>
-            <div style={{ ...display, fontSize: 32, color: T.gold, margin: "8px 0 16px" }}>
+            <div style={{ ...display, fontSize: 34, color: T.gold, margin: "10px 0 18px", letterSpacing: "0.04em" }}>
               New PR{celebrate.length > 1 ? "s" : ""}!
             </div>
             {celebrate.map((p) => (
