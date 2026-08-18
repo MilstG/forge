@@ -23,11 +23,23 @@ const writeJson = (f, data) => {
   fs.renameSync(tmp, fileFor(f)); // atomic-ish write
 };
 
-/* ---- simple password gate for all API routes ---- */
-const PASSWORD = process.env.APP_PASSWORD || "";
+/* ---- simple password gate for all API routes ----
+   The token travels in a header, so it is percent-encoded by the client
+   (HTTP headers can't carry non-ASCII, e.g. accented characters).
+   Values are trimmed because env vars often pick up stray whitespace. */
+const PASSWORD = (process.env.APP_PASSWORD || "").trim();
+const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag"]);
+const tokenMatches = (raw) => {
+  if (!PASSWORD) return true;
+  if (!raw) return false;
+  const candidates = [String(raw).trim()];
+  try { candidates.push(decodeURIComponent(String(raw)).trim()); } catch (e) {}
+  try { candidates.push(Buffer.from(String(raw), "base64").toString("utf8").trim()); } catch (e) {}
+  return candidates.includes(PASSWORD);
+};
 app.use("/api", (req, res, next) => {
-  if (req.path === "/whoop/callback") return next(); // OAuth redirect from WHOOP
-  if (PASSWORD && req.headers["x-app-token"] !== PASSWORD) {
+  if (OPEN_PATHS.has(req.path)) return next(); // OAuth redirect + non-sensitive diagnostics
+  if (!tokenMatches(req.headers["x-app-token"])) {
     return res.status(401).json({ error: "unauthorized" });
   }
   next();
@@ -64,6 +76,9 @@ app.post("/api/whoop/auth-url", (req, res) => {
 app.get("/api/whoop/diag", (req, res) => {
   const t = readJson("whoop.json", null);
   res.json({
+    password_protected: !!PASSWORD,
+    password_length: PASSWORD ? PASSWORD.length : 0,
+    password_is_ascii: PASSWORD ? /^[\x20-\x7E]*$/.test(PASSWORD) : true,
     client_id_set: !!process.env.WHOOP_CLIENT_ID,
     client_secret_set: !!process.env.WHOOP_CLIENT_SECRET,
     app_url_env: process.env.APP_URL || null,
