@@ -173,9 +173,21 @@ async function askClaude(prompt, maxTokens = 1500) {
     headers: apiHeaders(),
     body: JSON.stringify({ prompt, max_tokens: maxTokens }),
   });
-  if (!res.ok) throw new Error("claude " + res.status);
-  const data = await res.json();
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    throw new Error((data && data.error) || `Request failed (${res.status}).`);
+  }
   return (data.text || "").replace(/```json|```/g, "").trim();
+}
+
+// Models sometimes wrap JSON in prose; take the outermost object.
+function parseJson(text) {
+  const t = (text || "").trim();
+  try { return JSON.parse(t); } catch (e) {}
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));
+  throw new Error("The model didn't return usable JSON.");
 }
 
 /* ================= component ================= */
@@ -617,13 +629,13 @@ Respond ONLY with valid JSON, no markdown fences, no preamble:
 The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun in order.`;
     try {
       const clean = await askClaude(prompt, 2500);
-      const parsed = JSON.parse(clean);
+      const parsed = parseJson(clean);
       const withMeta = { ...parsed, created: todayStr };
       setPlan(withMeta);
       persist({ plan: withMeta });
       setOpenDay(todayIdx);
     } catch (e) {
-      setPlanErr("Couldn't build your plan. Try again in a moment.");
+      setPlanErr(String(e.message || e));
     }
     setPlanBusy(false);
   };
@@ -725,13 +737,13 @@ Respond ONLY with valid JSON, no markdown fences:
 Exactly ${n} entries in "weeks". Include at least one Deload week placed for recovery, and make the final week test or peak toward their specific goals.`;
     try {
       const clean = await askClaude(prompt, 1400);
-      const b = JSON.parse(clean);
+      const b = parseJson(clean);
       const nb = { name: b.name || `${n}-week block`, start: todayKey, weeks: b.weeks || [] };
       setBlock(nb);
       persist({ block: nb });
       getPlan(profile, { block: nb });
     } catch (e) {
-      setPlanErr("Couldn't design the block. Try again in a moment.");
+      setPlanErr(String(e.message || e));
     }
     setBlockBusy(false);
   };
@@ -752,7 +764,7 @@ Replace "${cur.exercise}" (${cur.sets}×${cur.reps}) with a DIFFERENT movement t
 Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+cur.sets || 3},"reps":"${cur.reps || "8-10"}","load":"short load guidance","why":"one short sentence on why this swap works"}`;
     try {
       const clean = await askClaude(prompt, 400);
-      const alt = JSON.parse(clean);
+      const alt = parseJson(clean);
       const np = JSON.parse(JSON.stringify(plan));
       np.week[di].exercises[ei] = { exercise: alt.exercise, sets: alt.sets, reps: alt.reps, load: alt.load };
       setPlan(np);
@@ -760,7 +772,7 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
       setSwapNote(`⇄ Swapped in ${alt.exercise}${alt.why ? " — " + alt.why : ""}`);
       setTimeout(() => setSwapNote(""), 8000);
     } catch (e) {
-      setSwapNote("Couldn't find a swap — try again.");
+      setSwapNote(String(e.message || e).slice(0, 160));
       setTimeout(() => setSwapNote(""), 4000);
     }
     setSwapBusy(null);
@@ -829,7 +841,7 @@ Respond ONLY with valid JSON, no markdown fences:
 {"day":"${dy.day}","rest":false,"focus":"session title","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
     try {
       const clean = await askClaude(prompt, 1200);
-      const adj = JSON.parse(clean);
+      const adj = parseJson(clean);
       const np = JSON.parse(JSON.stringify(plan));
       np.originalDay = { idx: todayIdx, day: dy };
       np.week[todayIdx] = { day: adj.day || dy.day, rest: false, focus: adj.focus || dy.focus, exercises: adj.exercises || dy.exercises };
@@ -886,14 +898,14 @@ Respond ONLY with valid JSON, no markdown fences:
 }`;
     try {
       const clean = await askClaude(prompt, 900);
-      const info = JSON.parse(clean);
+      const info = parseJson(clean);
       exCache.current[key] = info;
       try {
         await fetch("/api/exinfo", { method: "PUT", headers: apiHeaders(), body: JSON.stringify(exCache.current) });
       } catch (e) {}
       setModal({ name, info });
     } catch (e) {
-      setModal({ name, err: "Couldn't load the guide. Tap to retry.", retry: true });
+      setModal({ name, err: String(e.message || e).slice(0, 200) + " — tap to retry.", retry: true });
     }
   };
 
@@ -927,12 +939,12 @@ Respond ONLY with valid JSON, no markdown fences:
 }`;
     try {
       const clean = await askClaude(prompt, 1200);
-      const parsed = JSON.parse(clean);
+      const parsed = parseJson(clean);
       const withMeta = { ...parsed, date: todayStr };
       setInsights(withMeta);
       persist({ insights: withMeta });
     } catch (e) {
-      setInsights({ headline: "Couldn't run the analysis — try again.", wins: [], gaps: [], actions: [], date: todayStr });
+      setInsights({ headline: String(e.message || e).slice(0, 220), wins: [], gaps: [], actions: [], date: todayStr });
     }
     setInsightsBusy(false);
   };
