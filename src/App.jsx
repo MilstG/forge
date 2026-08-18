@@ -317,6 +317,37 @@ export default function Forge() {
     return () => clearInterval(id);
   }, []);
 
+  /* Keep the screen awake during a live session — phones lock mid-set otherwise. */
+  useEffect(() => {
+    let lock = null, cancelled = false;
+    const acquire = async () => {
+      try {
+        if ("wakeLock" in navigator && (live || restEnd)) {
+          lock = await navigator.wakeLock.request("screen");
+        }
+      } catch (e) { /* unsupported or denied — harmless */ }
+    };
+    acquire();
+    const onVis = () => { if (document.visibilityState === "visible" && !cancelled) acquire(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVis);
+      document.removeEventListener("visibilitychange", onVis);
+      if (lock) { try { lock.release(); } catch (e) {} }
+    };
+  }, [live, restEnd]);
+
+  /* Buzz once when the rest timer hits zero. */
+  const buzzed = useRef(false);
+  useEffect(() => {
+    if (!restEnd) { buzzed.current = false; return; }
+    if (nowTs >= restEnd && !buzzed.current) {
+      buzzed.current = true;
+      try { if (navigator.vibrate) navigator.vibrate([160, 90, 160]); } catch (e) {}
+    }
+  }, [nowTs, restEnd]);
+
   /* ---------- derived ---------- */
   const volumeOf = (w) => w.exercises.reduce((s, e) => {
     const st = +e.sets || 0, rp = +e.reps || 0, wt = +e.weight || 0;
@@ -952,7 +983,7 @@ Respond ONLY with valid JSON, no markdown fences:
   /* ---------- styles ---------- */
   const S = {
     page: {
-      height: "100vh", background: T.bg, color: T.text,
+      height: "100dvh", minHeight: "100svh", background: T.bg, color: T.text,
       display: "flex", flexDirection: "column", overflow: "hidden", position: "relative",
       fontFamily: FB, letterSpacing: "-0.005em",
     },
@@ -971,12 +1002,12 @@ Respond ONLY with valid JSON, no markdown fences:
     num: (size = 15, color) => ({ ...mono, fontSize: size, fontWeight: 500, color: color || T.text, letterSpacing: "-0.02em" }),
     input: {
       width: "100%", boxSizing: "border-box", padding: "11px 13px", borderRadius: 9,
-      border: `1px solid ${T.line}`, background: T.bg, color: T.text, fontSize: 15,
+      border: `1px solid ${T.line}`, background: T.bg, color: T.text, fontSize: 16,
       outline: "none", fontFamily: FB,
     },
     inputNum: {
       width: "100%", boxSizing: "border-box", padding: "11px 12px", borderRadius: 9,
-      border: `1px solid ${T.line}`, background: T.bg, color: T.text, fontSize: 15,
+      border: `1px solid ${T.line}`, background: T.bg, color: T.text, fontSize: 16,
       outline: "none", ...mono, textAlign: "center",
     },
     btn: {
@@ -1049,6 +1080,7 @@ Respond ONLY with valid JSON, no markdown fences:
     <div style={{
       background: T.surface, borderBottom: `1px solid ${T.line}`,
       padding: "13px 16px 12px", flexShrink: 0,
+      paddingTop: "calc(13px + env(safe-area-inset-top))",
     }}>
       <div style={{ maxWidth: 660, margin: "0 auto", display: "flex", alignItems: "center", gap: 13 }}>
         <Ring pct={lvPct} />
@@ -1092,7 +1124,10 @@ Respond ONLY with valid JSON, no markdown fences:
   );
 
   const Tabs = () => (
-    <div style={{ flexShrink: 0, zIndex: 10, background: T.surface, borderTop: `1px solid ${T.line}` }}>
+    <div style={{
+      flexShrink: 0, zIndex: 10, background: T.surface, borderTop: `1px solid ${T.line}`,
+      paddingBottom: "env(safe-area-inset-bottom)",
+    }}>
       <div style={{ maxWidth: 660, margin: "0 auto", display: "flex" }}>
         {[["coach", "Plan"], ["log", "Log"], ["history", "Log book"], ["stats", "Stats"], ["profile", "You"]].map(([k, l]) => {
           const on = tab === k;
@@ -1233,9 +1268,9 @@ Respond ONLY with valid JSON, no markdown fences:
           )}
           <div style={S.card}>
             <Rule label="About you" />
-            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
               {[["age", "Age", "34"], ["height", "Height (cm)", "176"], ["weight", "Weight (kg)", "78"]].map(([k, l, ph]) => (
-                <div key={k} style={{ flex: 1 }}>
+                <div key={k} style={{ flex: 1, minWidth: 88 }}>
                   <span style={S.label}>{l}</span>
                   <input style={S.input} inputMode="decimal" value={d[k]} onChange={(e) => setDF(k, e.target.value)} placeholder={ph} />
                 </div>
@@ -1291,8 +1326,8 @@ Respond ONLY with valid JSON, no markdown fences:
                 ))}
               </div>
             )}
-            <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-              <input style={S.input} value={addInj} placeholder="e.g. left knee — avoid deep flexion"
+            <div style={{ display: "flex", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+              <input style={{ ...S.input, minWidth: 160, flex: 1, width: "auto" }} value={addInj} placeholder="e.g. left knee — avoid deep flexion"
                 onChange={(e) => setAddInj(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && addInj.trim()) { setDF("injuries", [...(d.injuries || []), addInj.trim()]); setAddInj(""); } }} />
               <button style={{ ...S.ghost, whiteSpace: "nowrap" }}
@@ -1994,7 +2029,7 @@ Respond ONLY with valid JSON, no markdown fences:
             </div>
 
             {/* tiles */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(92px,1fr))", gap: 9, marginBottom: 12 }}>
               {[
                 [workouts.length, "Sessions"],
                 [(totalKg >= 1000 ? Math.round(totalKg / 1000) + "t" : Math.round(totalKg) + "kg"), "Iron lifted"],
@@ -2146,8 +2181,8 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* body weight */}
             <div style={S.card}>
               <Rule label="Body weight" />
-              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-                <input style={S.input} inputMode="decimal" placeholder="Today's weight (kg)"
+              <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                <input style={{ ...S.input, minWidth: 150, flex: 1, width: "auto" }} inputMode="decimal" placeholder="Today's weight (kg)"
                   value={bwInput} onChange={(e) => setBwInput(e.target.value)} />
                 <button style={{ ...S.ghost, whiteSpace: "nowrap" }} onClick={logBodyWeight}>Log</button>
               </div>
@@ -2182,10 +2217,10 @@ Respond ONLY with valid JSON, no markdown fences:
                 </p>
               ) : (
                 <>
-                  <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-                    <input style={S.input} inputMode="numeric" placeholder={`kcal today${todayNut && todayNut.kcal ? ` (${todayNut.kcal})` : ""}`}
+                  <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                    <input style={{ ...S.input, minWidth: 110, flex: 1, width: "auto" }} inputMode="numeric" placeholder={`kcal today${todayNut && todayNut.kcal ? ` (${todayNut.kcal})` : ""}`}
                       value={nKcal} onChange={(e) => setNKcal(e.target.value)} />
-                    <input style={S.input} inputMode="numeric" placeholder={`protein g${todayNut && todayNut.protein ? ` (${todayNut.protein})` : ""}`}
+                    <input style={{ ...S.input, minWidth: 110, flex: 1, width: "auto" }} inputMode="numeric" placeholder={`protein g${todayNut && todayNut.protein ? ` (${todayNut.protein})` : ""}`}
                       value={nProt} onChange={(e) => setNProt(e.target.value)} />
                     <button style={{ ...S.ghost, whiteSpace: "nowrap" }} onClick={saveNutrition}>Log</button>
                   </div>
@@ -2242,7 +2277,7 @@ Respond ONLY with valid JSON, no markdown fences:
             {/* achievements */}
             <div style={S.card}>
               <Rule label="Achievements" />
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(92px,1fr))", gap: 8 }}>
                 {earned.map((b) => (
                   <div key={b.id} style={{
                     background: b.on ? T.accentDim : T.surface2,
