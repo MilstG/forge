@@ -3,9 +3,26 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#101318" />
+    <meta name="theme-color" content="#0B0C0F" />
     <title>Forge</title>
-    <style>html,body,#root{margin:0;height:100%;background:#101318}</style>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <style>
+      html, body, #root { margin: 0; height: 100%; background: #0B0C0F; }
+      * { -webkit-tap-highlight-color: transparent; }
+      body { font-family: 'Inter', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+      input, textarea, select, button { font-family: inherit; }
+      input::placeholder, textarea::placeholder { color: #4A4E55; }
+      /* slim scrollbars that match the panel aesthetic */
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: #25292F; border-radius: 3px; }
+      input[type="date"] { color-scheme: dark; }
+      input:focus, textarea:focus, select:focus { border-color: #FF5F2E !important; }
+      button:focus-visible, a:focus-visible { outline: 2px solid #FF5F2E; outline-offset: 2px; }
+      @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+    </style>
   </head>
   <body>
     <div id="root"></div>
