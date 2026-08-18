@@ -211,6 +211,22 @@ async function fetchWhoopSummary() {
     updated: new Date().toISOString(),
   };
   whoopCache = { at: Date.now(), data };
+
+  // Persist a daily snapshot — correlations need history, not just today.
+  try {
+    const day = data.recoveryCreatedAt ? dateInTz(new Date(data.recoveryCreatedAt)) : dateInTz();
+    if (data.recovery != null) {
+      const hist = readJson("whoop-history.json", []);
+      const rest = hist.filter((h) => h.date !== day);
+      rest.push({
+        date: day, recovery: data.recovery, hrv: data.hrv, rhr: data.rhr,
+        sleepHours: data.sleepHours, sleepPerf: data.sleepPerf, strain: data.strain,
+      });
+      rest.sort((a, b) => (a.date < b.date ? -1 : 1));
+      writeJson("whoop-history.json", rest.slice(-400));
+    }
+  } catch (e) { console.error("[whoop] history write failed", String(e.message || e)); }
+
   return data;
 }
 
@@ -224,6 +240,8 @@ app.get("/api/whoop/summary", async (_req, res) => {
     res.status(502).json({ error: String(e) });
   }
 });
+
+app.get("/api/whoop/history", (_req, res) => res.json(readJson("whoop-history.json", [])));
 
 app.post("/api/whoop/disconnect", (_req, res) => {
   try { fs.unlinkSync(fileFor("whoop.json")); } catch (e) {}
