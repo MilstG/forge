@@ -262,34 +262,43 @@ const PREFERRED_OPENAI = [
 ];
 let resolvedModel = null;
 
+// Base URL is overridable for Azure / gateways / proxies.
+const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+const failedModels = new Set();
+
+async function readErr(r) {
+  const raw = await r.text().catch(() => "");
+  let msg = "";
+  try { const j = JSON.parse(raw); msg = (j.error && (j.error.message || j.error.code)) || ""; } catch (e) {}
+  return msg || raw.slice(0, 300) || "(empty response body)";
+}
+
 async function openaiModels() {
-  const r = await fetch("https://api.openai.com/v1/models", {
-    headers: { Authorization: "Bearer " + OPENAI_KEY },
-  });
-  if (!r.ok) {
-    const e = await r.json().catch(() => ({}));
-    throw new Error(`OpenAI /models (${r.status}): ${(e.error && e.error.message) || "request failed"}`);
-  }
+  const url = OPENAI_BASE + "/models";
+  const r = await fetch(url, { headers: { Authorization: "Bearer " + OPENAI_KEY } });
+  if (!r.ok) throw new Error(`GET ${url} -> ${r.status}: ${await readErr(r)}`);
   const d = await r.json();
   return (d.data || []).map((m) => m.id);
 }
 
 async function resolveModel() {
-  if (resolvedModel) return resolvedModel;
+  if (resolvedModel && !failedModels.has(resolvedModel)) return resolvedModel;
+  resolvedModel = null;
   if (PROVIDER === "anthropic") {
     resolvedModel = process.env.ANTHROPIC_MODEL || process.env.MODEL || "claude-sonnet-5";
     return resolvedModel;
   }
-  const pinned = process.env.OPENAI_MODEL || process.env.MODEL;
-  if (pinned) { resolvedModel = pinned.trim(); return resolvedModel; }
+  const pinned = (process.env.OPENAI_MODEL || process.env.MODEL || "").trim();
+  if (pinned && !failedModels.has(pinned)) { resolvedModel = pinned; return resolvedModel; }
   try {
     const ids = await openaiModels();
     for (const want of PREFERRED_OPENAI) {
-      const hit = ids.find((id) => id === want) || ids.find((id) => id.startsWith(want));
+      const hit = ids.find((id) => id === want && !failedModels.has(id))
+        || ids.find((id) => id.startsWith(want) && !failedModels.has(id));
       if (hit) { resolvedModel = hit; console.log("[ai] auto-selected model:", hit); return hit; }
     }
     // nothing from the preference list — fall back to any chat-capable gpt id
-    const any = ids.filter((id) => /^gpt-/.test(id)).sort()[0];
+    const any = ids.filter((id) => /^gpt-/.test(id) && !failedModels.has(id)).sort()[0];
     if (any) { resolvedModel = any; console.log("[ai] falling back to model:", any); return any; }
     throw new Error("No usable GPT model found on this account.");
   } catch (e) {
@@ -307,28 +316,50 @@ async function callAI(prompt, maxTokens = 1500) {
   const cap = Math.min(Math.max(maxTokens || 1500, 4000), 16000);
 
   if (PROVIDER === "openai") {
-    const body = {
-      model,
-      messages: [{ role: "user", content: String(prompt || "") }],
-      // every prompt in this app asks for JSON; this makes parsing reliable
-      response_format: { type: "json_object" },
-      // newer OpenAI models require max_completion_tokens and reject max_tokens
-      max_completion_tokens: cap,
-    };
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json", Authorization: "Bearer " + OPENAI_KEY },
-      body: JSON.stringify(body),
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      const msg = (data.error && data.error.message) || JSON.stringify(data).slice(0, 300);
-      throw new Error(`OpenAI (${r.status}, model ${model}): ${msg}`);
+    let useModel = model, lastErr = null;
+    // A model can be renamed or unavailable on an account; on a model-shaped
+    // error we blacklist it, pick the next preference, and retry.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const url = OPENAI_BASE + "/chat/completions";
+      let r, data;
+      try {
+        r = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", Authorization: "Bearer " + OPENAI_KEY },
+          body: JSON.stringify({
+            model: useModel,
+            messages: [{ role: "user", content: String(prompt || "") }],
+            // every prompt in this app asks for JSON; this makes parsing reliable
+            response_format: { type: "json_object" },
+            // newer OpenAI models require max_completion_tokens and reject max_tokens
+            max_completion_tokens: cap,
+          }),
+        });
+      } catch (e) {
+        throw new Error(`Network error reaching ${url}: ${String(e.message || e)}`);
+      }
+      if (!r.ok) {
+        const detail = await readErr(r);
+        lastErr = `POST ${url} (model ${useModel}) -> ${r.status}: ${detail}`;
+        const modelIssue = r.status === 404 || /model/i.test(detail);
+        if (modelIssue) {
+          console.warn("[ai] model rejected:", useModel, detail);
+          failedModels.add(useModel);
+          try { useModel = await resolveModel(); } catch (e) { break; }
+          if (failedModels.has(useModel)) break;
+          continue;
+        }
+        break;
+      }
+      data = await r.json();
+      const choice = (data.choices || [])[0] || {};
+      const text = (choice.message && choice.message.content) || "";
+      if (!text.trim()) {
+        throw new Error(`Model ${useModel} returned no text (finish_reason: ${choice.finish_reason || "unknown"}).`);
+      }
+      return text;
     }
-    const choice = (data.choices || [])[0] || {};
-    const text = (choice.message && choice.message.content) || "";
-    if (!text.trim()) throw new Error(`Model returned no text (finish_reason: ${choice.finish_reason || "unknown"}). Try a higher token limit.`);
-    return text;
+    throw new Error(lastErr || "OpenAI request failed and no usable model was found.");
   }
 
   // Anthropic
@@ -341,11 +372,8 @@ async function callAI(prompt, maxTokens = 1500) {
     },
     body: JSON.stringify({ model, max_tokens: cap, messages: [{ role: "user", content: String(prompt || "") }] }),
   });
+  if (!r.ok) throw new Error(`Claude API (${r.status}, model ${model}): ${await readErr(r)}`);
   const data = await r.json();
-  if (!r.ok) {
-    const msg = (data.error && data.error.message) || JSON.stringify(data).slice(0, 300);
-    throw new Error(`Claude API (${r.status}, model ${model}): ${msg}`);
-  }
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
   if (!text.trim()) throw new Error(`Model returned no text (stop_reason: ${data.stop_reason || "unknown"}).`);
   return text;
@@ -368,6 +396,9 @@ app.get("/api/ai/diag", async (req, res) => {
     openai_key_set: !!OPENAI_KEY,
     anthropic_key_set: !!ANTHROPIC_KEY,
     pinned_model: process.env.OPENAI_MODEL || process.env.ANTHROPIC_MODEL || process.env.MODEL || null,
+    base_url: PROVIDER === "openai" ? OPENAI_BASE : "https://api.anthropic.com",
+    key_prefix: (OPENAI_KEY || ANTHROPIC_KEY).slice(0, 7) || null,
+    rejected_models: [...failedModels],
     resolved_model: resolvedModel,
   };
   try {
