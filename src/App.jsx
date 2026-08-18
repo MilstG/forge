@@ -160,9 +160,11 @@ const BADGES = [
 /* ================= API helpers (server-backed) ================= */
 let APP_TOKEN = null;
 try { APP_TOKEN = localStorage.getItem("forge-token"); } catch (e) {}
+// HTTP headers can't carry non-ASCII (accents, ñ, emoji), so the token is
+// percent-encoded here and decoded server-side.
 const apiHeaders = () => ({
   "Content-Type": "application/json",
-  ...(APP_TOKEN ? { "x-app-token": APP_TOKEN } : {}),
+  ...(APP_TOKEN ? { "x-app-token": encodeURIComponent(APP_TOKEN) } : {}),
 });
 
 async function askClaude(prompt, maxTokens = 1500) {
@@ -205,6 +207,7 @@ export default function Forge() {
   const [loaded, setLoaded] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
   const [pw, setPw] = useState("");
+  const [pwErr, setPwErr] = useState("");
 
   const [d, setD] = useState({
     age: "", sex: "M", height: "", weight: "",
@@ -270,9 +273,24 @@ export default function Forge() {
     })();
   }, []);
 
-  const unlock = () => {
-    try { localStorage.setItem("forge-token", pw); } catch (e) {}
-    window.location.reload();
+  const unlock = async () => {
+    const val = pw.trim();
+    if (!val) return;
+    setPwErr("");
+    try {
+      const r = await fetch("/api/data", {
+        headers: { "Content-Type": "application/json", "x-app-token": encodeURIComponent(val) },
+      });
+      if (r.status === 401) { setPwErr("That password doesn't match. Check the APP_PASSWORD variable in Railway."); return; }
+      if (!r.ok) { setPwErr("Server error — try again in a moment."); return; }
+      try { localStorage.setItem("forge-token", val); } catch (e) {
+        setPwErr("This browser is blocking local storage, so the password can't be saved. Turn off private browsing.");
+        return;
+      }
+      window.location.reload();
+    } catch (e) {
+      setPwErr("Couldn't reach the server. Check your connection.");
+    }
   };
 
   const persist = async (patch = {}) => {
@@ -1173,6 +1191,12 @@ Respond ONLY with valid JSON, no markdown fences:
               onKeyDown={(e) => e.key === "Enter" && unlock()}
               style={{ ...S.input, marginBottom: 12 }} />
             <button style={S.btn} onClick={unlock}>Unlock</button>
+            {pwErr && (
+              <div style={{
+                marginTop: 12, fontSize: 12.5, lineHeight: 1.5, color: T.red,
+                background: T.redDim, borderLeft: `2px solid ${T.red}`, borderRadius: 8, padding: "10px 12px",
+              }}>{pwErr}</div>
+            )}
           </div>
         </div>
       </div>
