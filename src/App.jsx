@@ -196,6 +196,7 @@ export default function Forge() {
   const [nProt, setNProt] = useState("");
   const [whoop, setWhoop] = useState(null);
   const [whoopConn, setWhoopConn] = useState(false);
+  const [whoopErr, setWhoopErr] = useState("");
   const [swapBusy, setSwapBusy] = useState(null);
   const [swapNote, setSwapNote] = useState("");
   const [addInj, setAddInj] = useState("");
@@ -763,9 +764,28 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
   };
 
   /* ----- whoop ----- */
+  const connectWhoop = async () => {
+    setWhoopErr("");
+    try {
+      const r = await fetch("/api/whoop/auth-url", { method: "POST", headers: apiHeaders() });
+      if (r.status === 401) {
+        setWhoopErr("Your session isn't authenticated. Reload the app and enter your password, then try again.");
+        return;
+      }
+      const data = await r.json();
+      if (!r.ok || !data.url) {
+        setWhoopErr(data.error || "Couldn't start the WHOOP connection.");
+        return;
+      }
+      window.location.href = data.url;
+    } catch (e) {
+      setWhoopErr("Network error reaching the server. Try again in a moment.");
+    }
+  };
+
   const disconnectWhoop = async () => {
     try { await fetch("/api/whoop/disconnect", { method: "POST", headers: apiHeaders() }); } catch (e) {}
-    setWhoopConn(false); setWhoop(null);
+    setWhoopConn(false); setWhoop(null); setWhoopErr("");
   };
 
   /* ----- daily auto-adjust to recovery ----- */
@@ -1260,11 +1280,16 @@ Respond ONLY with valid JSON, no markdown fences:
                   <p style={{ color: T.sub, fontSize: 13, marginTop: 0 }}>
                     Connect your WHOOP and the coach will calibrate each day's intensity to your recovery, sleep and strain.
                   </p>
-                  <a href={`/api/whoop/auth?token=${encodeURIComponent(APP_TOKEN || "")}`}
-                    style={{ ...S.btn, display: "block", textAlign: "center", textDecoration: "none", boxSizing: "border-box" }}>
-                    Connect WHOOP
-                  </a>
-                  <p style={{ color: T.sub, fontSize: 11.5, marginBottom: 0 }}>
+                  <button style={S.btn} onClick={connectWhoop}>Connect WHOOP</button>
+                  {whoopErr && (
+                    <div style={{
+                      marginTop: 10, fontSize: 12.5, lineHeight: 1.5, color: T.red,
+                      background: T.redDim, borderLeft: `2px solid ${T.red}`, borderRadius: 8, padding: "10px 12px",
+                    }}>
+                      {whoopErr}
+                    </div>
+                  )}
+                  <p style={{ color: T.dim, fontSize: 11.5, marginBottom: 0 }}>
                     Needs WHOOP_CLIENT_ID / WHOOP_CLIENT_SECRET set on the server — see the README.
                   </p>
                 </>
