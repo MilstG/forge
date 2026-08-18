@@ -139,7 +139,7 @@ const GEAR = [
   ["bands", "Resistance bands"], ["pullup-bar", "Pull-up bar"], ["machines", "Gym machines"], ["cardio", "Cardio machines"],
 ];
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const emptyEx = () => ({ name: "", sets: "", reps: "", weight: "" });
+const emptyEx = () => ({ name: "", sets: "", reps: "", weight: "", rpe: "" });
 
 /* ================= gamification ================= */
 const xpOf = (ws) => ws.reduce((s, w) => s + 50 + w.exercises.length * 10, 0);
@@ -245,6 +245,12 @@ export default function Forge() {
   const [insightsBusy, setInsightsBusy] = useState(false);
   const [statEx, setStatEx] = useState("");
   const [bwInput, setBwInput] = useState("");
+  const [statView, setStatView] = useState("overview");
+  const [checkins, setCheckins] = useState([]);
+  const [measurements, setMeasurements] = useState([]);
+  const [whoopHist, setWhoopHist] = useState([]);
+  const [mInput, setMInput] = useState({ waist: "", chest: "", arms: "", thighs: "" });
+  const [ciDraft, setCiDraft] = useState({ energy: null, mood: null, soreness: [] });
 
   /* ---------- load ---------- */
   useEffect(() => {
@@ -265,6 +271,8 @@ export default function Forge() {
         if (data.reviewedWeek) setReviewedWeek(data.reviewedWeek);
         if (data.block) setBlock(data.block);
         if (data.nutrition) setNutrition(data.nutrition);
+        if (data.checkins) setCheckins(data.checkins);
+        if (data.measurements) setMeasurements(data.measurements);
       }
       try {
         const c = await fetch("/api/exinfo", { headers: apiHeaders() });
@@ -279,6 +287,8 @@ export default function Forge() {
           if (st.connected) {
             const r = await fetch("/api/whoop/summary", { headers: apiHeaders() });
             if (r.ok) setWhoop(await r.json());
+            const h = await fetch("/api/whoop/history", { headers: apiHeaders() });
+            if (h.ok) setWhoopHist(await h.json());
           }
         }
       } catch (e) {}
@@ -306,7 +316,7 @@ export default function Forge() {
   };
 
   const persist = async (patch = {}) => {
-    const full = { profile, workouts, bodyLog, plan, insights, live, reviewedWeek, block, nutrition, ...patch };
+    const full = { profile, workouts, bodyLog, plan, insights, live, reviewedWeek, block, nutrition, checkins, measurements, ...patch };
     try {
       await fetch("/api/data", { method: "PUT", headers: apiHeaders(), body: JSON.stringify(full) });
     } catch (e) { console.error("save failed", e); }
@@ -461,17 +471,241 @@ export default function Forge() {
   const bwDelta = bwSorted.length >= 2
     ? (bwSorted[bwSorted.length - 1].weight - bwSorted[0].weight).toFixed(1) : null;
 
+  /* ================= deep analytics ================= */
+  const E1RM = (w, r) => (+w || 0) * (1 + (+r || 1) / 30);
+  const round1 = (n) => Math.round(n * 10) / 10;
+  const dayDiff = (a, b) => Math.round((new Date(a) - new Date(b)) / 864e5);
+
+  // --- per-workout enrichment ---
+  const wVolume = (w) => w.exercises.reduce((s2, e) =>
+    s2 + (+e.sets || 0) * (+e.reps || 0) * (+e.weight || 0), 0);
+
+  // --- weekly muscle-group volume trend (12 weeks) ---
+  const weekList12 = (() => {
+    const out = [];
+    for (let i = 11; i >= 0; i--) {
+      const dt = new Date(todayKey + "T00:00:00"); dt.setDate(dt.getDate() - 7 * i);
+      out.push(dt.toISOString().slice(0, 10));
+    }
+    return out;
+  })();
+  const muscleTrend = (() => {
+    const map = {};
+    workouts.forEach((w) => {
+      const k = weekKey(w.date);
+      if (!weekList12.includes(k)) return;
+      w.exercises.forEach((e) => {
+        const g = groupFor(e.name);
+        const v = (+e.sets || 0) * (+e.reps || 0) * (+e.weight || 0) || (+e.sets || 1) * 20;
+        map[g] = map[g] || {};
+        map[g][k] = (map[g][k] || 0) + v;
+      });
+    });
+    return Object.entries(map)
+      .map(([g, byWeek]) => ({
+        label: g,
+        points: weekList12.map((k, i) => ({ x: i, y: byWeek[k] || 0 })),
+        total: Object.values(byWeek).reduce((a, b) => a + b, 0),
+      }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 5);
+  })();
+
+  // --- e1RM trend for the big lifts ---
+  const PATTERNS = [
+    ["Squat", /squat/i, "#FF5F2E"],
+    ["Bench", /bench|chest press/i, "#63A0FF"],
+    ["Deadlift", /deadlift/i, "#3FD69A"],
+    ["Press", /overhead|shoulder press|ohp|military/i, "#F2B437"],
+    ["Row", /row|pulldown|pull-?up|chin/i, "#C77DFF"],
+  ];
+  const liftHistory = PATTERNS.map(([label, re, color]) => {
+    const pts = [];
+    [...workouts].sort((a, b) => (a.date < b.date ? -1 : 1)).forEach((w) => {
+      let best = 0;
+      w.exercises.forEach((e) => {
+        if (re.test(e.name) && +e.weight > 0) best = Math.max(best, E1RM(e.weight, e.reps));
+      });
+      if (best > 0) pts.push({ date: w.date, y: Math.round(best) });
+    });
+    return { label, color, pts, best: pts.length ? Math.max(...pts.map((p) => p.y)) : 0 };
+  }).filter((l) => l.pts.length > 0);
+
+  const bigThreeTotal = ["Squat", "Bench", "Deadlift"]
+    .map((n) => (liftHistory.find((l) => l.label === n) || {}).best || 0);
+  const totalKgBig3 = bigThreeTotal.reduce((a, b) => a + b, 0);
+
+  // --- strength ratios vs typical reference values ---
+  const bestOf = (label) => (liftHistory.find((l) => l.label === label) || {}).best || 0;
+  const RATIOS = [
+    ["Bench / Squat", bestOf("Bench"), bestOf("Squat"), 0.75],
+    ["Deadlift / Squat", bestOf("Deadlift"), bestOf("Squat"), 1.2],
+    ["Press / Bench", bestOf("Press"), bestOf("Bench"), 0.6],
+    ["Row / Bench", bestOf("Row"), bestOf("Bench"), 0.8],
+  ].filter(([, a, b]) => a > 0 && b > 0)
+    .map(([label, a, b, ref]) => {
+      const val = a / b;
+      const pct = (val - ref) / ref;
+      return { label, val: round1(val * 100) / 100, ref, verdict: pct > 0.12 ? "high" : pct < -0.12 ? "low" : "balanced" };
+    });
+
+  // --- relative strength (× bodyweight) ---
+  const bwNow = bwSorted.length ? bwSorted[bwSorted.length - 1].weight : (profile ? +profile.weight : 0);
+  const relStrength = bwNow > 0
+    ? liftHistory.map((l) => ({ label: l.label, x: round1(l.best / bwNow * 100) / 100, kg: l.best, color: l.color }))
+    : [];
+
+  // --- consistency heatmap (last ~26 weeks) ---
+  const trainedDates = new Set(workouts.map((w) => w.date));
+  const heatWeeks = (() => {
+    const weeks = [];
+    const start = new Date(todayKey + "T00:00:00");
+    start.setDate(start.getDate() - 7 * 25);
+    for (let wi = 0; wi < 26; wi++) {
+      const col = [];
+      for (let di = 0; di < 7; di++) {
+        const dt = new Date(start); dt.setDate(dt.getDate() + wi * 7 + di);
+        const ds = dt.toISOString().slice(0, 10);
+        const w = workouts.find((x) => x.date === ds);
+        col.push({ ds, on: trainedDates.has(ds), vol: w ? wVolume(w) : 0, future: ds > todayStr });
+      }
+      weeks.push(col);
+    }
+    return weeks;
+  })();
+  const maxDayVol = Math.max(1, ...workouts.map(wVolume));
+
+  // --- rep range distribution (by sets) ---
+  const repRanges = (() => {
+    const b = { "1-5": 0, "6-12": 0, "13+": 0 };
+    workouts.forEach((w) => w.exercises.forEach((e) => {
+      const r = +e.reps || 0, st = +e.sets || 1;
+      if (!r) return;
+      if (r <= 5) b["1-5"] += st; else if (r <= 12) b["6-12"] += st; else b["13+"] += st;
+    }));
+    const tot = b["1-5"] + b["6-12"] + b["13+"] || 1;
+    return { b, tot, pct: { "1-5": Math.round(b["1-5"] / tot * 100), "6-12": Math.round(b["6-12"] / tot * 100), "13+": Math.round(b["13+"] / tot * 100) } };
+  })();
+  const goalRange = profile && /strength/i.test(profile.goal) ? "1-5"
+    : profile && /muscle/i.test(profile.goal) ? "6-12"
+    : profile && /(endurance|fat)/i.test(profile.goal) ? "13+" : null;
+
+  // --- session timing & duration ---
+  const timed = workouts.filter((w) => w.hour != null);
+  const byPartOfDay = (() => {
+    const buckets = { Morning: [], Midday: [], Evening: [], Night: [] };
+    timed.forEach((w) => {
+      const h = w.hour;
+      const k = h < 11 ? "Morning" : h < 16 ? "Midday" : h < 21 ? "Evening" : "Night";
+      buckets[k].push(wVolume(w));
+    });
+    return Object.entries(buckets)
+      .filter(([, v]) => v.length)
+      .map(([k, v]) => ({ label: k, n: v.length, avg: Math.round(v.reduce((a, b) => a + b, 0) / v.length) }));
+  })();
+  const durations = workouts.filter((w) => w.durationMin).map((w) => w.durationMin);
+  const avgDuration = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null;
+
+  // --- exercise frequency & staleness ---
+  const exStats = (() => {
+    const m = {};
+    workouts.forEach((w) => w.exercises.forEach((e) => {
+      const n = e.name.trim(); if (!n) return;
+      m[n] = m[n] || { name: n, count: 0, last: w.date, sets: 0 };
+      m[n].count++;
+      m[n].sets += +e.sets || 0;
+      if (w.date > m[n].last) m[n].last = w.date;
+    }));
+    return Object.values(m).sort((a, b) => b.count - a.count);
+  })();
+  const stale = exStats.filter((e) => dayDiff(todayStr, e.last) > 21).slice(0, 6);
+
+  // --- RPE analytics ---
+  const rpeEntries = [];
+  workouts.forEach((w) => w.exercises.forEach((e) => {
+    if (+e.rpe > 0) rpeEntries.push({ date: w.date, name: e.name, rpe: +e.rpe });
+  }));
+  const rpeByWeek = weekList12.map((k, i) => {
+    const vals = rpeEntries.filter((r) => weekKey(r.date) === k).map((r) => r.rpe);
+    return { x: i, y: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0, n: vals.length };
+  });
+  const avgRpe = rpeEntries.length ? round1(rpeEntries.reduce((a, b) => a + b.rpe, 0) / rpeEntries.length) : null;
+
+  // --- WHOOP correlations ---
+  const pearson = (pairs) => {
+    const n = pairs.length;
+    if (n < 4) return null;
+    const mx = pairs.reduce((a, p) => a + p.x, 0) / n, my = pairs.reduce((a, p) => a + p.y, 0) / n;
+    let num = 0, dx = 0, dy = 0;
+    pairs.forEach((p) => { num += (p.x - mx) * (p.y - my); dx += (p.x - mx) ** 2; dy += (p.y - my) ** 2; });
+    if (!dx || !dy) return null;
+    return round1(num / Math.sqrt(dx * dy) * 100) / 100;
+  };
+  const whoopByDate = {}; whoopHist.forEach((h) => { whoopByDate[h.date] = h; });
+  const recoveryVsVolume = workouts
+    .filter((w) => whoopByDate[w.date] && whoopByDate[w.date].recovery != null && wVolume(w) > 0)
+    .map((w) => ({ x: whoopByDate[w.date].recovery, y: Math.round(wVolume(w)), date: w.date }));
+  const sleepVsVolume = workouts
+    .filter((w) => whoopByDate[w.date] && whoopByDate[w.date].sleepHours != null && wVolume(w) > 0)
+    .map((w) => ({ x: whoopByDate[w.date].sleepHours, y: Math.round(wVolume(w)), date: w.date }));
+  const strainVsRecovery = whoopHist
+    .map((h, i) => {
+      const next = whoopHist[i + 1];
+      if (!next || h.strain == null || next.recovery == null) return null;
+      if (dayDiff(next.date, h.date) !== 1) return null;
+      return { x: h.strain, y: next.recovery, date: h.date };
+    }).filter(Boolean);
+  const rpeVsRecovery = rpeEntries
+    .filter((r) => whoopByDate[r.date] && whoopByDate[r.date].recovery != null)
+    .map((r) => ({ x: whoopByDate[r.date].recovery, y: r.rpe, date: r.date }));
+  const weeklyRecovery = weekList12.map((k, i) => {
+    const vals = whoopHist.filter((h) => weekKey(h.date) === k && h.recovery != null).map((h) => h.recovery);
+    return { x: i, y: vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0 };
+  });
+  const weeklyVolume12 = weekList12.map((k, i) => ({
+    x: i, y: workouts.filter((w) => weekKey(w.date) === k).reduce((a, w) => a + wVolume(w), 0),
+  }));
+
+  // --- check-ins (mood / energy / soreness) ---
+  const ciSorted = [...checkins].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const moodVsVolume = ciSorted
+    .map((c) => {
+      const w = workouts.find((x) => x.date === c.date);
+      return w && c.energy ? { x: c.energy, y: Math.round(wVolume(w)), date: c.date } : null;
+    }).filter(Boolean);
+  const sorenessCount = (() => {
+    const m = {};
+    ciSorted.slice(-30).forEach((c) => (c.soreness || []).forEach((g) => { m[g] = (m[g] || 0) + 1; }));
+    return Object.entries(m).sort((a, b) => b[1] - a[1]);
+  })();
+  const todayCheckin = checkins.find((c) => c.date === todayStr) || null;
+
+  // --- body measurements ---
+  const MEAS = [["waist", "Waist"], ["chest", "Chest"], ["arms", "Arms"], ["thighs", "Thighs"]];
+  const measSorted = [...measurements].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const measDelta = (k) => {
+    const pts = measSorted.filter((m) => +m[k] > 0);
+    if (pts.length < 2) return null;
+    return round1(+pts[pts.length - 1][k] - +pts[0][k]);
+  };
+
   /* ----- progression memory ----- */
   const lastPerfFor = (name) => {
     const k = (name || "").trim().toLowerCase();
     if (!k) return null;
     for (const w of workouts) { // workouts are sorted newest-first
       const e = w.exercises.find((x) => x.name.trim().toLowerCase() === k);
-      if (e) return { sets: e.sets, reps: e.reps, weight: +e.weight || 0, date: w.date };
+      if (e) return { sets: e.sets, reps: e.reps, weight: +e.weight || 0, rpe: e.rpe || "", date: w.date };
     }
     return null;
   };
-  const suggestNext = (perf) => (perf && perf.weight ? Math.round((perf.weight + 2.5) * 2) / 2 : null);
+  // RPE-aware progression: hard last time → hold, easy → bigger jump
+  const suggestNext = (perf) => {
+    if (!perf || !perf.weight) return null;
+    const r = +perf.rpe || 0;
+    const step = r >= 9.5 ? 0 : r >= 8.5 ? 1.25 : r > 0 && r <= 6 ? 5 : 2.5;
+    return Math.round((perf.weight + step) * 2) / 2;
+  };
 
   /* ----- rest timer duration by goal ----- */
   const restSecs = ({ "Build strength": 180, "Build muscle": 90, "Lose fat": 60, "Endurance": 60, "General fitness": 90 })[profile && profile.goal] || 90;
@@ -643,7 +877,13 @@ Athlete:
 - Available equipment: ${gearLabels.join(", ")}${(p.injuries || []).length ? `
 - Injuries / limitations: ${p.injuries.join("; ")} — avoid movements that aggravate these and pick safe alternatives.` : ""}${whoop && whoop.recovery != null ? `
 - Today's WHOOP: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr} bpm, sleep ${whoop.sleepHours}h${whoop.sleepPerf ? ` (${whoop.sleepPerf}% performance)` : ""}, yesterday's strain ${whoop.strain}. Calibrate intensity to recovery: under 34% go much lighter, 34-66% moderate, above 66% full intensity.` : ""}${bc.ctx}
-- Recent workouts (most recent first): ${JSON.stringify(recent)}
+- Recent workouts (most recent first, rpe is 1-10 perceived effort where given): ${JSON.stringify(recent)}${avgRpe ? `
+- Average logged RPE: ${avgRpe}. If recent RPE at given loads is 9+, hold or reduce load rather than adding weight; if 6 or below, add a larger jump.` : ""}${todayCheckin && (todayCheckin.soreness || []).length ? `
+- Reported sore today: ${todayCheckin.soreness.join(", ")} — avoid hammering these, or program them lightly.` : ""}${sorenessCount.length ? `
+- Frequently sore areas recently: ${sorenessCount.slice(0, 3).map(([g, n]) => `${g} (${n}x)`).join(", ")}.` : ""}${RATIOS.filter((r) => r.verdict === "low").length ? `
+- Strength imbalances to address: ${RATIOS.filter((r) => r.verdict === "low").map((r) => r.label + " is low").join("; ")}. Bias volume toward the lagging lift.` : ""}${goalRange && repRanges.tot > 20 && repRanges.pct[goalRange] < 50 ? `
+- Rep-range mismatch: their goal calls for ${goalRange} reps but only ${repRanges.pct[goalRange]}% of sets are there. Correct this.` : ""}${stale.length ? `
+- Movements they have dropped for 3+ weeks: ${stale.map((e) => e.name).join(", ")}. Reintroduce if useful.` : ""}
 
 Build a full 7-day week, Monday to Sunday, with exactly ${p.days} training days and ${7 - p.days} rest days. Place rest days sensibly for recovery. Use ONLY the available equipment. Progress loads in small steps vs their history. Serve the specific goals directly. Give every TRAINING day its own one-line warm-up that primes the specific muscles and movements in that session. On rest days give a one-line recovery suggestion (walk, stretch, mobility) instead.
 ${deloadNow ? "IMPORTANT: This must be a DELOAD week. Cut loads to roughly 60% of their recent working weights and reduce total sets by about 40%. Keep the same movement patterns, keep everything far from failure, and say in \"why\" that this is a recovery week and why it earns them progress." : ""}
@@ -700,11 +940,16 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
         sets: Array.from({ length: targetSets }).map(() => ({
           reps: targetReps.split("-")[0],
           weight: perf && perf.weight ? String(perf.weight) : "",
-          done: false,
+          done: false, rpe: "",
         })),
       };
     });
-    const lv = { startedAt: Date.now(), date: todayStr, idx: 0, focus: dayObj.focus || "", warmup: dayObj.warmup || "", warmupDone: false, exercises: sessionEx };
+    const lv = {
+      startedAt: Date.now(), date: todayStr, idx: 0, focus: dayObj.focus || "",
+      warmup: dayObj.warmup || "", warmupDone: false,
+      checkin: todayCheckin ? { ...todayCheckin, saved: true } : null,
+      exercises: sessionEx,
+    };
     setLive(lv); persist({ live: lv });
     setRestEnd(null);
     setTab("live");
@@ -722,11 +967,13 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
       const ds = ex.sets.filter((s) => s.done);
       if (!ds.length) return null;
       const weight = Math.max(...ds.map((s) => +s.weight || 0));
+      const rpes = ds.map((x) => +x.rpe).filter((v) => v > 0);
       return {
         name: ex.name,
         sets: String(ds.length),
         reps: String(ds[ds.length - 1].reps || ""),
         weight: weight ? String(weight) : "",
+        rpe: rpes.length ? String(round1(rpes.reduce((a, b) => a + b, 0) / rpes.length)) : "",
       };
     }).filter(Boolean);
     if (!entries.length) { discardLive(); return; }
@@ -737,11 +984,21 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
         return wt > 0 && wt > ((prs[k] || {}).weight || 0);
       })
       .map((e) => ({ name: e.name.trim(), weight: +e.weight, old: (prs[e.name.trim().toLowerCase()] || {}).weight || null }));
-    const w = { id: Date.now(), date: live.date || todayStr, exercises: entries, notes: `Live session · ${mins} min` };
+    const startedDate = new Date(live.startedAt);
+    const w = {
+      id: Date.now(), date: live.date || todayStr, exercises: entries,
+      notes: `Live session · ${mins} min`,
+      startedAt: live.startedAt, durationMin: mins, hour: startedDate.getHours(),
+    };
     const next = [w, ...workouts].sort((a, b) => (a.date < b.date ? 1 : -1));
     setWorkouts(next);
+    let nextCi = checkins;
+    if (live.checkin && !checkins.some((c) => c.date === (live.date || todayStr))) {
+      nextCi = [...checkins, { ...live.checkin, date: live.date || todayStr }];
+      setCheckins(nextCi);
+    }
     setLive(null); setRestEnd(null);
-    persist({ workouts: next, live: null });
+    persist({ workouts: next, live: null, checkins: nextCi });
     setTab("coach");
     if (newPRs.length) setCelebrate(newPRs);
   };
@@ -822,6 +1079,18 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
     setNutrition(next);
     persist({ nutrition: next });
     setNKcal(""); setNProt("");
+  };
+
+  const saveMeasurements = () => {
+    const entry = { date: todayStr };
+    let any = false;
+    MEAS.forEach(([k]) => { if (+mInput[k] > 0) { entry[k] = +mInput[k]; any = true; } });
+    if (!any) return;
+    const prev = measurements.find((m) => m.date === todayStr) || {};
+    const merged = { ...prev, ...entry };
+    const next = [...measurements.filter((m) => m.date !== todayStr), merged];
+    setMeasurements(next); persist({ measurements: next });
+    setMInput({ waist: "", chest: "", arms: "", thighs: "" });
   };
 
   /* ----- whoop ----- */
@@ -959,7 +1228,18 @@ ${(profile.injuries || []).length ? `Injuries/limitations: ${profile.injuries.jo
 ` : ""}${whoop && whoop.recovery != null ? `WHOOP today: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr}, sleep ${whoop.sleepHours}h, strain ${whoop.strain}
 ` : ""}${nutAvg && nut ? `Nutrition last 7 days (${nutAvg.n} logged): avg ${nutAvg.k} kcal vs ${nut.kcal} target, ${nutAvg.p}g protein vs ${nut.protein}g target
 ` : ""}${block && blockPhase ? `Training block "${block.name}": week ${blockWeek}/${block.weeks.length}, phase ${blockPhase.type}
+` : ""}${avgRpe ? `Average RPE ${avgRpe} across ${rpeEntries.length} rated sets.
+` : ""}${RATIOS.length ? `Strength ratios: ${RATIOS.map((r) => `${r.label} ${r.val} (ref ${r.ref}, ${r.verdict})`).join("; ")}.
+` : ""}${relStrength.length ? `Relative strength at ${bwNow}kg: ${relStrength.map((r) => `${r.label} ${r.x}x bw`).join(", ")}.
+` : ""}${repRanges.tot ? `Rep-range split: ${repRanges.pct["1-5"]}% heavy (1-5), ${repRanges.pct["6-12"]}% moderate, ${repRanges.pct["13+"]}% light.
+` : ""}${stale.length ? `Dropped movements (3+ weeks): ${stale.map((e) => e.name).join(", ")}.
+` : ""}${recoveryVsVolume.length >= 4 ? `Recovery-vs-volume correlation r=${pearson(recoveryVsVolume)} over ${recoveryVsVolume.length} sessions.
+` : ""}${sleepVsVolume.length >= 4 ? `Sleep-vs-volume correlation r=${pearson(sleepVsVolume)}.
+` : ""}${avgDuration ? `Average session ${avgDuration} min. Output by time of day: ${byPartOfDay.map((b) => `${b.label} ${b.avg}`).join(", ")}.
+` : ""}${measSorted.length > 1 ? `Measurement changes (cm): ${MEAS.map(([k, l]) => { const d = measDelta(k); return d != null ? `${l} ${d > 0 ? "+" : ""}${d}` : null; }).filter(Boolean).join(", ")}.
 ` : ""}Recent sessions: ${JSON.stringify(recent)}
+
+Use the correlations and ratios above — cite the actual numbers. If a correlation is weak (|r| < 0.2), say so rather than inventing a pattern.
 
 Respond ONLY with valid JSON, no markdown fences:
 {
@@ -1051,6 +1331,142 @@ Respond ONLY with valid JSON, no markdown fences:
       borderBottom: last ? "none" : `1px solid ${T.lineSoft}`,
       cursor: onClick ? "pointer" : "default", ...style,
     }}>{children}</div>
+  );
+
+  /* ================= chart primitives ================= */
+  const LineChart = ({ series, height = 120, yFmt = (v) => v, xLabels = [], area = false }) => {
+    const W = 320, H = height, pad = { l: 30, r: 6, t: 8, b: 16 };
+    const all = series.flatMap((s2) => s2.points.map((p) => p.y));
+    const maxY = Math.max(1, ...all), minY = Math.min(0, ...all);
+    const maxX = Math.max(1, ...series.flatMap((s2) => s2.points.map((p) => p.x)));
+    const px = (x) => pad.l + (x / maxX) * (W - pad.l - pad.r);
+    const py = (y) => H - pad.b - ((y - minY) / (maxY - minY || 1)) * (H - pad.t - pad.b);
+    return (
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ overflow: "visible" }}>
+        {[0, 0.5, 1].map((f) => (
+          <g key={f}>
+            <line x1={pad.l} x2={W - pad.r} y1={py(minY + f * (maxY - minY))} y2={py(minY + f * (maxY - minY))}
+              stroke={T.lineSoft} strokeWidth="1" />
+            <text x={pad.l - 4} y={py(minY + f * (maxY - minY)) + 3} textAnchor="end"
+              fill={T.dim} fontSize="7.5" fontFamily={FM}>{yFmt(Math.round(minY + f * (maxY - minY)))}</text>
+          </g>
+        ))}
+        {series.map((s2, si) => {
+          const d = s2.points.map((p, i) => `${i ? "L" : "M"}${px(p.x)},${py(p.y)}`).join(" ");
+          return (
+            <g key={si}>
+              {area && <path d={`${d} L${px(s2.points[s2.points.length - 1].x)},${py(minY)} L${px(s2.points[0].x)},${py(minY)} Z`}
+                fill={s2.color || T.accent} opacity="0.10" />}
+              <path d={d} fill="none" stroke={s2.color || T.accent} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
+              {s2.points.length < 25 && s2.points.map((p, i) => (
+                <circle key={i} cx={px(p.x)} cy={py(p.y)} r="2" fill={s2.color || T.accent} />
+              ))}
+            </g>
+          );
+        })}
+        {xLabels.map((l, i) => (
+          <text key={i} x={px((i / Math.max(1, xLabels.length - 1)) * maxX)} y={H - 4}
+            textAnchor="middle" fill={T.dim} fontSize="7.5" fontFamily={FM}>{l}</text>
+        ))}
+      </svg>
+    );
+  };
+
+  const Legend = ({ items }) => (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 8 }}>
+      {items.map((i) => (
+        <span key={i.label} style={{ fontSize: 10.5, color: T.sub, display: "inline-flex", alignItems: "center", gap: 5 }}>
+          <span style={{ width: 8, height: 2, background: i.color, display: "inline-block" }} />
+          {i.label}{i.extra ? <span style={{ ...mono, color: T.dim }}> {i.extra}</span> : null}
+        </span>
+      ))}
+    </div>
+  );
+
+  const Scatter = ({ points, xLabel, yLabel, height = 140, color = T.accent, yFmt = (v) => v, bands }) => {
+    const W = 320, H = height, pad = { l: 34, r: 8, t: 8, b: 24 };
+    if (!points.length) return <div style={{ color: T.dim, fontSize: 13 }}>Not enough paired data yet.</div>;
+    const xs = points.map((p) => p.x), ys = points.map((p) => p.y);
+    const xMin = Math.min(...xs), xMax = Math.max(...xs) || 1;
+    const yMin = 0, yMax = Math.max(...ys) || 1;
+    const px = (x) => pad.l + ((x - xMin) / ((xMax - xMin) || 1)) * (W - pad.l - pad.r);
+    const py = (y) => H - pad.b - ((y - yMin) / ((yMax - yMin) || 1)) * (H - pad.t - pad.b);
+    const r = pearson(points);
+    // least-squares trend line
+    let trend = null;
+    if (points.length >= 4) {
+      const n = points.length, mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
+      let num = 0, den = 0;
+      points.forEach((p) => { num += (p.x - mx) * (p.y - my); den += (p.x - mx) ** 2; });
+      if (den) { const m = num / den, b = my - m * mx; trend = { x1: xMin, y1: m * xMin + b, x2: xMax, y2: m * xMax + b }; }
+    }
+    return (
+      <>
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ overflow: "visible" }}>
+          {bands && bands.map((b, i) => (
+            <rect key={i} x={px(b.from)} y={pad.t} width={Math.max(0, px(b.to) - px(b.from))}
+              height={H - pad.t - pad.b} fill={b.color} opacity="0.07" />
+          ))}
+          {[0, 0.5, 1].map((f) => (
+            <g key={f}>
+              <line x1={pad.l} x2={W - pad.r} y1={py(yMin + f * (yMax - yMin))} y2={py(yMin + f * (yMax - yMin))} stroke={T.lineSoft} />
+              <text x={pad.l - 4} y={py(yMin + f * (yMax - yMin)) + 3} textAnchor="end" fill={T.dim} fontSize="7.5" fontFamily={FM}>
+                {yFmt(Math.round(yMin + f * (yMax - yMin)))}
+              </text>
+            </g>
+          ))}
+          {trend && <line x1={px(trend.x1)} y1={py(trend.y1)} x2={px(trend.x2)} y2={py(trend.y2)}
+            stroke={T.sub} strokeWidth="1.2" strokeDasharray="4 3" />}
+          {points.map((p, i) => <circle key={i} cx={px(p.x)} cy={py(p.y)} r="3" fill={color} opacity="0.75" />)}
+          <text x={pad.l} y={H - 6} fill={T.dim} fontSize="8" fontFamily={FM}>{Math.round(xMin)}</text>
+          <text x={W - pad.r} y={H - 6} textAnchor="end" fill={T.dim} fontSize="8" fontFamily={FM}>{Math.round(xMax)}</text>
+          <text x={(W) / 2} y={H - 6} textAnchor="middle" fill={T.dim} fontSize="8.5">{xLabel}</text>
+        </svg>
+        <div style={{ fontSize: 11.5, color: T.sub, marginTop: 6 }}>
+          {yLabel} vs {xLabel} · <span style={{ ...mono }}>n={points.length}</span>
+          {r != null && <>
+            {" · "}<span style={{ ...mono, color: Math.abs(r) >= 0.4 ? T.accent : T.dim }}>r={r}</span>
+            <span style={{ color: T.dim }}>
+              {" "}({Math.abs(r) < 0.2 ? "no relationship" : Math.abs(r) < 0.4 ? "weak" : Math.abs(r) < 0.6 ? "moderate" : "strong"}
+              {r < -0.2 ? ", inverse" : ""})
+            </span>
+          </>}
+        </div>
+      </>
+    );
+  };
+
+  const Heatmap = () => (
+    <>
+      <div style={{ display: "flex", gap: 2, overflowX: "auto", paddingBottom: 4 }}>
+        {heatWeeks.map((col, ci) => (
+          <div key={ci} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            {col.map((d) => (
+              <div key={d.ds} title={d.on ? `${d.ds} · ${Math.round(d.vol).toLocaleString()} vol` : d.ds}
+                style={{
+                  width: 9, height: 9, borderRadius: 2,
+                  background: d.future ? "transparent"
+                    : d.on ? `rgba(255,95,46,${0.3 + 0.7 * Math.min(1, d.vol / maxDayVol)})`
+                    : T.surface2,
+                  border: d.ds === todayStr ? `1px solid ${T.blue}` : "none",
+                  boxSizing: "border-box",
+                }} />
+            ))}
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: T.dim, marginTop: 6 }}>
+        <span>26 weeks ago</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+          less
+          {[0.3, 0.55, 0.8, 1].map((o) => (
+            <span key={o} style={{ width: 8, height: 8, borderRadius: 2, background: `rgba(255,95,46,${o})` }} />
+          ))}
+          more
+        </span>
+        <span>today</span>
+      </div>
+    </>
   );
 
   const Ring = ({ pct, size = 46 }) => {
@@ -1754,7 +2170,39 @@ Respond ONLY with valid JSON, no markdown fences:
                 <div style={{ fontSize: 13, color: T.sub }}>{elapsedMin} min · {totalDone} sets done</div>
               </div>
 
-              {live.warmup && !live.warmupDone && (
+              {!live.checkin && (
+                <div style={{ ...S.card, borderLeft: `2px solid ${T.blue}`, background: T.blueDim }}>
+                  <div style={{
+                    fontSize: 9.5, color: T.blue, textTransform: "uppercase",
+                    letterSpacing: "0.14em", fontWeight: 600, marginBottom: 10,
+                  }}>Before you start</div>
+                  {[["energy", "Energy"], ["mood", "Mood"]].map(([k, label]) => (
+                    <div key={k} style={{ marginBottom: 12 }}>
+                      <span style={S.label}>{label}</span>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        {[1, 2, 3, 4, 5].map((n) => (
+                          <button key={n} onClick={() => setCiDraft((d2) => ({ ...d2, [k]: n }))}
+                            style={{ ...S.chip(ciDraft[k] === n), flex: 1, ...mono, textAlign: "center" }}>{n}</button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  <span style={S.label}>Sore anywhere?</span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14 }}>
+                    {["Legs", "Hamstrings", "Glutes", "Back", "Chest", "Shoulders", "Arms", "Core"].map((g) => (
+                      <button key={g} onClick={() => setCiDraft((d2) => ({
+                        ...d2, soreness: (d2.soreness || []).includes(g)
+                          ? d2.soreness.filter((x) => x !== g) : [...(d2.soreness || []), g],
+                      }))} style={S.chip((ciDraft.soreness || []).includes(g))}>{g}</button>
+                    ))}
+                  </div>
+                  <button style={S.btn} onClick={() => updLive((nl) => {
+                    nl.checkin = { energy: ciDraft.energy || null, mood: ciDraft.mood || null, soreness: ciDraft.soreness || [] };
+                  }, true)}>Start training</button>
+                </div>
+              )}
+
+              {live.checkin && live.warmup && !live.warmupDone && (
                 <div style={{
                   ...S.card, background: T.goodDim, borderColor: T.line,
                   borderLeft: `2px solid ${T.good}`,
@@ -1843,6 +2291,11 @@ Respond ONLY with valid JSON, no markdown fences:
                     <input inputMode="numeric" placeholder="reps" value={s.reps} disabled={s.done}
                       onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[si].reps = e.target.value; })}
                       style={{ ...S.inputNum, width: 64, flex: "none", padding: "10px 8px" }} />
+                    {s.done && (
+                      <input inputMode="decimal" placeholder="RPE" value={s.rpe}
+                        onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[si].rpe = e.target.value; }, true)}
+                        style={{ ...S.inputNum, width: 58, flex: "none", padding: "10px 6px", fontSize: 14 }} />
+                    )}
                     <button
                       onClick={() => {
                         if (s.done) { updLive((nl) => { nl.exercises[nl.idx].sets[si].done = false; }, true); return; }
@@ -1863,7 +2316,7 @@ Respond ONLY with valid JSON, no markdown fences:
                   onClick={() => updLive((nl) => {
                     const cur = nl.exercises[nl.idx];
                     const lastSet = cur.sets[cur.sets.length - 1] || { reps: cur.targetReps.split("-")[0], weight: "" };
-                    cur.sets.push({ reps: lastSet.reps, weight: lastSet.weight, done: false });
+                    cur.sets.push({ reps: lastSet.reps, weight: lastSet.weight, done: false, rpe: "" });
                   }, true)}>
                   + Extra set
                 </button>
@@ -1910,8 +2363,8 @@ Respond ONLY with valid JSON, no markdown fences:
                       onChange={(e) => setExs((a) => a.map((x, j) => j === i ? { ...x, name: e.target.value } : x))}
                       style={{ ...S.input, background: T.surface, marginBottom: 8 }} />
                     <div style={{ display: "flex", gap: 8 }}>
-                      {["sets", "reps", "weight"].map((f) => (
-                        <input key={f} placeholder={f === "weight" ? "kg" : f}
+                      {["sets", "reps", "weight", "rpe"].map((f) => (
+                        <input key={f} placeholder={f === "weight" ? "kg" : f === "rpe" ? "RPE" : f}
                           inputMode="decimal" value={ex[f]}
                           onChange={(e) => setExs((a) => a.map((x, j) => j === i ? { ...x, [f]: e.target.value } : x))}
                           style={{ ...S.inputNum }} />
@@ -2017,7 +2470,20 @@ Respond ONLY with valid JSON, no markdown fences:
         {/* ================= STATS ================= */}
         {tab === "stats" && (
           <>
+            <div style={{ display: "flex", gap: 4, marginBottom: 14, overflowX: "auto", paddingBottom: 2 }}>
+              {[["overview", "Overview"], ["strength", "Strength"], ["muscle", "Muscle"], ["recovery", "Recovery"], ["body", "Body"]].map(([k, l]) => (
+                <button key={k} onClick={() => setStatView(k)} style={{
+                  flex: "1 0 auto", padding: "8px 13px", borderRadius: 7, cursor: "pointer",
+                  border: `1px solid ${statView === k ? T.accent : T.line}`,
+                  background: statView === k ? T.accentDim : "transparent",
+                  color: statView === k ? T.accent : T.dim,
+                  fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.09em",
+                  fontWeight: statView === k ? 700 : 500, fontSize: 11.5, whiteSpace: "nowrap",
+                }}>{l}</button>
+              ))}
+            </div>
             {/* AI coach review */}
+            {statView === "overview" && (<>
             <div style={{ ...S.card, borderColor: T.blue }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                 <Rule label="Coach's review" />
@@ -2057,7 +2523,10 @@ Respond ONLY with valid JSON, no markdown fences:
               </button>
             </div>
 
+            </>)}
+
             {/* tiles */}
+            {statView === "overview" && (<>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(92px,1fr))", gap: 9, marginBottom: 12 }}>
               {[
                 [workouts.length, "Sessions"],
@@ -2074,7 +2543,10 @@ Respond ONLY with valid JSON, no markdown fences:
               ))}
             </div>
 
+            </>)}
+
             {/* adherence */}
+            {statView === "overview" && (<>
             <div style={S.card}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                 <Rule label="Plan adherence — last 8 weeks" />
@@ -2097,7 +2569,50 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             </div>
 
+            </>)}
+
+            {statView === "muscle" && muscleTrend.length > 0 && (
+              <div style={S.card}>
+                <Rule label="Volume by muscle group" right="12 weeks" />
+                <LineChart
+                  series={muscleTrend.map((m, i) => ({
+                    color: [T.accent, T.blue, T.good, T.gold, "#C77DFF"][i % 5],
+                    points: m.points,
+                  }))}
+                  yFmt={(v) => v >= 1000 ? Math.round(v / 1000) + "k" : v}
+                  xLabels={weekList12.map((k, i) => (i % 3 === 0 ? k.slice(5) : ""))}
+                  height={140}
+                />
+                <Legend items={muscleTrend.map((m, i) => ({
+                  label: m.label, color: [T.accent, T.blue, T.good, T.gold, "#C77DFF"][i % 5],
+                }))} />
+                <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8, lineHeight: 1.5 }}>
+                  Flat lines mean maintenance, not progress. Rising lines are where you're actually adding work.
+                </div>
+              </div>
+            )}
+
+            {statView === "muscle" && sorenessCount.length > 0 && (
+              <div style={S.card}>
+                <Rule label="Reported soreness" right="last 30 check-ins" />
+                {sorenessCount.map(([g, n]) => {
+                  const mx = sorenessCount[0][1] || 1;
+                  return (
+                    <div key={g} style={{ marginBottom: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 3 }}>
+                        <span>{g}</span><span style={{ ...mono, color: T.sub }}>{n}×</span>
+                      </div>
+                      <div style={{ height: 6, background: T.surface2, borderRadius: 3 }}>
+                        <div style={{ width: `${(n / mx) * 100}%`, height: "100%", background: T.gold, borderRadius: 3 }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
             {/* muscle groups detail */}
+            {statView === "muscle" && (<>
             {mList.length > 0 && (
               <div style={S.card}>
                 <Rule label="Muscle groups — last 28 days" />
@@ -2128,7 +2643,10 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             )}
 
+            </>)}
+
             {/* balance */}
+            {statView === "muscle" && (<>
             {(pushSets + pullSets + lowerSets) > 0 && (
               <div style={S.card}>
                 <Rule label="Balance — last 28 days" />
@@ -2158,7 +2676,10 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             )}
 
+            </>)}
+
             {/* weekly volume */}
+            {statView === "overview" && (<>
             <div style={S.card}>
               <Rule label="Weekly volume — last 8 weeks" />
               <div style={{ display: "flex", alignItems: "flex-end", gap: 7, height: 100 }}>
@@ -2175,7 +2696,88 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             </div>
 
+            </>)}
+
+            {statView === "strength" && (<>
+              {liftHistory.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Estimated 1RM trend" right={totalKgBig3 ? `big 3 total ${Math.round(totalKgBig3)} kg` : null} />
+                  <LineChart
+                    series={liftHistory.map((l) => ({
+                      color: l.color,
+                      points: l.pts.map((p, i) => ({ x: i, y: p.y })),
+                    }))}
+                    yFmt={(v) => v + ""}
+                    height={130}
+                  />
+                  <Legend items={liftHistory.map((l) => ({ label: l.label, color: l.color, extra: l.best + "kg" }))} />
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8, lineHeight: 1.5 }}>
+                    Epley estimate from your best set each session. Sessions on the x-axis, kg on the y.
+                  </div>
+                </div>
+              )}
+
+              {relStrength.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Relative strength" right={`at ${bwNow} kg bodyweight`} />
+                  {relStrength.map((r) => (
+                    <div key={r.label} style={{ marginBottom: 9 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 3 }}>
+                        <span>{r.label}</span>
+                        <span style={{ ...mono }}>
+                          <b style={{ color: r.color }}>{r.x}×</b>
+                          <span style={{ color: T.dim }}> bw · {r.kg}kg</span>
+                        </span>
+                      </div>
+                      <div style={{ height: 7, background: T.surface2, borderRadius: 4, position: "relative" }}>
+                        <div style={{ width: `${Math.min(100, r.x / 2.5 * 100)}%`, height: "100%", background: r.color, borderRadius: 4 }} />
+                        {[1, 1.5, 2].map((m) => (
+                          <span key={m} style={{ position: "absolute", left: `${m / 2.5 * 100}%`, top: -2, width: 1, height: 11, background: T.line }} />
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 6 }}>Ticks mark 1×, 1.5× and 2× bodyweight.</div>
+                </div>
+              )}
+
+              {RATIOS.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Strength ratios" />
+                  {RATIOS.map((r) => (
+                    <Row key={r.label} last={r === RATIOS[RATIOS.length - 1]}>
+                      <span style={{ flex: 1, fontSize: 13.5 }}>{r.label}</span>
+                      <span style={{ ...mono, fontSize: 13.5 }}>{r.val}</span>
+                      <span style={{ ...mono, fontSize: 11, color: T.dim }}>ref {r.ref}</span>
+                      <span style={{
+                        fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700,
+                        color: r.verdict === "balanced" ? T.good : r.verdict === "low" ? T.red : T.gold,
+                      }}>{r.verdict}</span>
+                    </Row>
+                  ))}
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 10, lineHeight: 1.5 }}>
+                    Reference values are typical for balanced lifters. A "low" ratio usually points at the weaker lift as your priority.
+                  </div>
+                </div>
+              )}
+
+              {rpeEntries.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Effort (RPE) over time" right={avgRpe ? `avg ${avgRpe}` : null} />
+                  <LineChart
+                    series={[{ color: T.gold, points: rpeByWeek.map((p) => ({ x: p.x, y: round1(p.y) })) }]}
+                    xLabels={weekList12.map((k, i) => (i % 3 === 0 ? k.slice(5) : ""))}
+                    height={110} area
+                  />
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8, lineHeight: 1.5 }}>
+                    Weekly average RPE from {rpeEntries.length} rated sets. Climbing RPE at the same loads is an early fatigue signal.
+                  </div>
+                </div>
+              )}
+            </>)}
+
             {/* progression */}
+            {statView === "strength" && (<>
             {exNames.length > 0 && (
               <div style={S.card}>
                 <Rule label="Exercise progression" />
@@ -2207,7 +2809,155 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             )}
 
+            </>)}
+
+            {statView === "recovery" && (<>
+              {!whoopConn && (
+                <div style={S.card}>
+                  <Rule label="Recovery insights" />
+                  <p style={{ color: T.sub, fontSize: 13.5, lineHeight: 1.6, margin: 0 }}>
+                    Connect WHOOP in the You tab to unlock these: whether training on low-recovery days actually
+                    costs you output, how sleep affects your lifting, and whether your volume is outrunning your recovery.
+                    Each one is answered from your own data, not general advice.
+                  </p>
+                </div>
+              )}
+
+              {whoopConn && whoopHist.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Volume vs recovery" right="12 weeks" />
+                  <LineChart
+                    series={[
+                      { color: T.accent, points: weeklyVolume12.map((p) => ({ x: p.x, y: p.y })) },
+                    ]}
+                    yFmt={(v) => v >= 1000 ? Math.round(v / 1000) + "k" : v}
+                    xLabels={weekList12.map((k, i) => (i % 3 === 0 ? k.slice(5) : ""))}
+                    height={100}
+                  />
+                  <LineChart
+                    series={[{ color: T.good, points: weeklyRecovery }]}
+                    yFmt={(v) => v + "%"}
+                    xLabels={weekList12.map((k, i) => (i % 3 === 0 ? k.slice(5) : ""))}
+                    height={90}
+                  />
+                  <Legend items={[
+                    { label: "Weekly volume", color: T.accent },
+                    { label: "Avg recovery", color: T.good },
+                  ]} />
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8, lineHeight: 1.5 }}>
+                    Volume climbing while recovery trends down is accumulated fatigue — the signal to deload
+                    before progress stalls.
+                  </div>
+                </div>
+              )}
+
+              {whoopConn && (
+                <div style={S.card}>
+                  <Rule label="Does low recovery cost you output?" />
+                  <Scatter points={recoveryVsVolume} xLabel="recovery %" yLabel="session volume"
+                    yFmt={(v) => v >= 1000 ? Math.round(v / 1000) + "k" : v}
+                    bands={[
+                      { from: 0, to: 34, color: T.red },
+                      { from: 34, to: 67, color: T.gold },
+                      { from: 67, to: 100, color: T.good },
+                    ]} />
+                </div>
+              )}
+
+              {whoopConn && (
+                <div style={S.card}>
+                  <Rule label="Sleep vs next-day output" />
+                  <Scatter points={sleepVsVolume} xLabel="hours slept" yLabel="session volume"
+                    color={T.blue} yFmt={(v) => v >= 1000 ? Math.round(v / 1000) + "k" : v} />
+                </div>
+              )}
+
+              {whoopConn && (
+                <div style={S.card}>
+                  <Rule label="Strain vs next-day recovery" />
+                  <Scatter points={strainVsRecovery} xLabel="strain" yLabel="next-day recovery %"
+                    color={T.gold} yFmt={(v) => v + "%"} />
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 6, lineHeight: 1.5 }}>
+                    A steep inverse slope means hard days cost you more than average — useful for spacing your
+                    heaviest sessions.
+                  </div>
+                </div>
+              )}
+
+              {whoopConn && rpeVsRecovery.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Recovery vs perceived effort" />
+                  <Scatter points={rpeVsRecovery} xLabel="recovery %" yLabel="RPE" color={T.red} />
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 6, lineHeight: 1.5 }}>
+                    If the same weights feel harder on low-recovery days, this slope shows it.
+                  </div>
+                </div>
+              )}
+
+              {moodVsVolume.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Energy vs output" right="from check-ins" />
+                  <Scatter points={moodVsVolume} xLabel="energy (1-5)" yLabel="session volume"
+                    color={T.good} yFmt={(v) => v >= 1000 ? Math.round(v / 1000) + "k" : v} />
+                </div>
+              )}
+
+              {ciSorted.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Mood & energy" right={`${ciSorted.length} check-ins`} />
+                  <LineChart
+                    series={[
+                      { color: T.good, points: ciSorted.slice(-20).map((c, i) => ({ x: i, y: c.energy || 0 })) },
+                      { color: T.blue, points: ciSorted.slice(-20).map((c, i) => ({ x: i, y: c.mood || 0 })) },
+                    ]}
+                    height={100}
+                  />
+                  <Legend items={[{ label: "Energy", color: T.good }, { label: "Mood", color: T.blue }]} />
+                </div>
+              )}
+            </>)}
+
+            {statView === "body" && (
+              <div style={S.card}>
+                <Rule label="Measurements" right="cm" />
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+                  {MEAS.map(([k, label]) => (
+                    <div key={k} style={{ flex: 1, minWidth: 74 }}>
+                      <span style={S.label}>{label}</span>
+                      <input style={S.inputNum} inputMode="decimal" value={mInput[k]}
+                        onChange={(e) => setMInput((m) => ({ ...m, [k]: e.target.value }))} />
+                    </div>
+                  ))}
+                </div>
+                <button style={{ ...S.ghost, width: "100%", marginBottom: 12 }} onClick={saveMeasurements}>
+                  Log today's measurements
+                </button>
+                {measSorted.length > 0 && (
+                  <>
+                    <LineChart
+                      series={MEAS.map(([k], i) => ({
+                        color: [T.accent, T.blue, T.good, T.gold][i],
+                        points: measSorted.filter((m) => +m[k] > 0).map((m, j) => ({ x: j, y: +m[k] })),
+                      })).filter((sr) => sr.points.length > 1)}
+                      height={120}
+                    />
+                    <Legend items={MEAS.map(([k, label], i) => {
+                      const d = measDelta(k);
+                      return {
+                        label, color: [T.accent, T.blue, T.good, T.gold][i],
+                        extra: d != null ? `${d > 0 ? "+" : ""}${d}cm` : null,
+                      };
+                    })} />
+                  </>
+                )}
+                <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8, lineHeight: 1.5 }}>
+                  Weight alone hides a recomp — waist down while arms and chest hold or grow is the pattern you want.
+                </div>
+              </div>
+            )}
+
             {/* body weight */}
+            {statView === "body" && (<>
             <div style={S.card}>
               <Rule label="Body weight" />
               <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
@@ -2234,7 +2984,10 @@ Respond ONLY with valid JSON, no markdown fences:
               )}
             </div>
 
+            </>)}
+
             {/* nutrition */}
+            {statView === "body" && (<>
             <div style={S.card}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                 <Rule label="Nutrition" />
@@ -2288,7 +3041,10 @@ Respond ONLY with valid JSON, no markdown fences:
               )}
             </div>
 
+            </>)}
+
             {/* PRs */}
+            {statView === "strength" && (<>
             {prList.length > 0 && (
               <div style={S.card}>
                 <Rule label="Personal records" />
@@ -2303,7 +3059,95 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
             )}
 
+            </>)}
+
+            {statView === "overview" && (<>
+              <div style={S.card}>
+                <Rule label="Consistency" right={`${workouts.length} sessions`} />
+                <Heatmap />
+              </div>
+
+              {repRanges.tot > 0 && (
+                <div style={S.card}>
+                  <Rule label="Rep range mix" right={`${repRanges.tot} sets`} />
+                  <div style={{ display: "flex", height: 14, borderRadius: 4, overflow: "hidden", marginBottom: 10 }}>
+                    {[["1-5", T.accent], ["6-12", T.blue], ["13+", T.good]].map(([k, c]) => (
+                      <div key={k} style={{ width: `${repRanges.pct[k]}%`, background: c }} />
+                    ))}
+                  </div>
+                  {[["1-5", T.accent, "Strength"], ["6-12", T.blue, "Hypertrophy"], ["13+", T.good, "Endurance"]].map(([k, c, name]) => (
+                    <div key={k} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, padding: "3px 0" }}>
+                      <span style={{ width: 8, height: 8, background: c, borderRadius: 2 }} />
+                      <span style={{ flex: 1, color: T.sub }}>{name} <span style={{ ...mono, color: T.dim }}>{k}</span></span>
+                      <span style={{ ...mono, color: goalRange === k ? T.accent : T.text }}>{repRanges.pct[k]}%</span>
+                    </div>
+                  ))}
+                  {goalRange && (
+                    <div style={{ fontSize: 12.5, color: T.sub, marginTop: 10, lineHeight: 1.5 }}>
+                      Your goal ({profile.goal.toLowerCase()}) lives in the <b style={{ color: T.accent }}>{goalRange}</b> range —
+                      {repRanges.pct[goalRange] >= 50
+                        ? " your training matches it."
+                        : ` only ${repRanges.pct[goalRange]}% of your sets are there.`}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {(byPartOfDay.length > 0 || avgDuration) && (
+                <div style={S.card}>
+                  <Rule label="Session patterns" right={avgDuration ? `avg ${avgDuration} min` : null} />
+                  {byPartOfDay.map((b) => {
+                    const mx = Math.max(...byPartOfDay.map((x) => x.avg)) || 1;
+                    return (
+                      <div key={b.label} style={{ marginBottom: 8 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 3 }}>
+                          <span>{b.label} <span style={{ ...mono, color: T.dim }}>n={b.n}</span></span>
+                          <span style={{ ...mono, color: T.sub }}>{b.avg.toLocaleString()} avg vol</span>
+                        </div>
+                        <div style={{ height: 7, background: T.surface2, borderRadius: 4 }}>
+                          <div style={{ width: `${(b.avg / mx) * 100}%`, height: "100%", background: T.blue, borderRadius: 4 }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {byPartOfDay.length === 0 && (
+                    <div style={{ fontSize: 13, color: T.dim }}>Log via live sessions to capture time of day.</div>
+                  )}
+                </div>
+              )}
+
+              {exStats.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Most trained" right={`${exStats.length} exercises`} />
+                  {exStats.slice(0, 6).map((e) => {
+                    const mx = exStats[0].count || 1;
+                    const ds = dayDiff(todayStr, e.last);
+                    return (
+                      <div key={e.name} style={{ marginBottom: 8 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 3 }}>
+                          <span>{e.name}</span>
+                          <span style={{ ...mono, color: ds > 21 ? T.red : T.dim }}>
+                            {e.count}× · {ds === 0 ? "today" : ds + "d"}
+                          </span>
+                        </div>
+                        <div style={{ height: 6, background: T.surface2, borderRadius: 3 }}>
+                          <div style={{ width: `${(e.count / mx) * 100}%`, height: "100%", background: T.accent, borderRadius: 3 }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {stale.length > 0 && (
+                    <div style={{ background: T.redDim, borderLeft: `2px solid ${T.red}`, borderRadius: 8, padding: "10px 12px", fontSize: 12.5, marginTop: 10, lineHeight: 1.5 }}>
+                      <b style={{ color: T.red }}>Dropped off · </b>
+                      {stale.map((e) => e.name).join(", ")} — not trained in 3+ weeks.
+                    </div>
+                  )}
+                </div>
+              )}
+            </>)}
+
             {/* achievements */}
+            {statView === "overview" && (<>
             <div style={S.card}>
               <Rule label="Achievements" />
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(92px,1fr))", gap: 8 }}>
@@ -2319,6 +3163,7 @@ Respond ONLY with valid JSON, no markdown fences:
                 ))}
               </div>
             </div>
+            </>)}
           </>
         )}
       </div>
