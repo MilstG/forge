@@ -2,6 +2,8 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import webpush from "web-push";
+import { dueReminders, DEFAULT_PUSH_PREFS } from "./push-rules.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -511,6 +513,158 @@ Respond ONLY with valid JSON, no markdown fences:
 }
 setInterval(autoAdjustCheck, 30 * 60 * 1000);
 setTimeout(autoAdjustCheck, 20 * 1000); // and shortly after boot
+
+/* ================= push notifications =================
+   Web Push works on iOS 16.4+ but only once the app is installed to the
+   Home Screen. Keys are generated once and persisted to the data volume,
+   so there is nothing to configure — set VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY
+   only if you want to pin your own pair. */
+const vapid = (() => {
+  const envPub = (process.env.VAPID_PUBLIC_KEY || "").trim();
+  const envPriv = (process.env.VAPID_PRIVATE_KEY || "").trim();
+  if (envPub && envPriv) return { publicKey: envPub, privateKey: envPriv };
+  const saved = readJson("vapid.json", null);
+  if (saved && saved.publicKey && saved.privateKey) return saved;
+  const fresh = webpush.generateVAPIDKeys();
+  writeJson("vapid.json", fresh);
+  console.log("[push] generated a new VAPID key pair");
+  return fresh;
+})();
+/* The subject must be a mailto: or https: URL — some push services reject
+   anything else outright. */
+const VAPID_SUBJECT = (() => {
+  const s = (process.env.VAPID_SUBJECT || process.env.APP_URL || "").trim();
+  if (/^mailto:/i.test(s) || /^https:\/\//i.test(s)) return s.replace(/\/$/, "");
+  return "mailto:forge@example.com";
+})();
+webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
+
+const pushPrefs = () => ({ ...DEFAULT_PUSH_PREFS, ...(readJson("push-prefs.json", {}) || {}) });
+const pushSubs = () => readJson("push-subs.json", []);
+const savePushSubs = (list) => writeJson("push-subs.json", list);
+
+/* Send to every subscription, dropping the ones the push service says are dead.
+   404/410 means the browser threw the subscription away — keeping it would
+   make every future send fail. */
+async function pushSend(payload) {
+  const subs = pushSubs();
+  if (!subs.length) return { sent: 0, dropped: 0 };
+  const body = JSON.stringify(payload);
+  let sent = 0;
+  const alive = [];
+  for (const s of subs) {
+    try {
+      await webpush.sendNotification(s.sub, body, { TTL: 4 * 60 * 60 });
+      sent++;
+      alive.push(s);
+    } catch (e) {
+      const code = e && e.statusCode;
+      if (code === 404 || code === 410) {
+        console.log("[push] dropping expired subscription");
+      } else {
+        console.error("[push] send failed:", code || String(e.message || e));
+        alive.push(s); // transient — keep it
+      }
+    }
+  }
+  if (alive.length !== subs.length) savePushSubs(alive);
+  return { sent, dropped: subs.length - alive.length };
+}
+
+app.get("/api/push/config", (_req, res) => {
+  res.json({
+    publicKey: vapid.publicKey,
+    subscriptions: pushSubs().length,
+    prefs: pushPrefs(),
+    timezone: TZNAME,
+  });
+});
+
+app.post("/api/push/subscribe", (req, res) => {
+  const sub = req.body && req.body.subscription;
+  if (!sub || !sub.endpoint) return res.status(400).json({ error: "missing subscription" });
+  const list = pushSubs().filter((s) => s.sub.endpoint !== sub.endpoint);
+  list.push({ sub, at: Date.now(), ua: String(req.headers["user-agent"] || "").slice(0, 160) });
+  savePushSubs(list.slice(-10)); // a handful of devices is plenty
+  res.json({ ok: true, subscriptions: list.length });
+});
+
+app.post("/api/push/unsubscribe", (req, res) => {
+  const ep = req.body && req.body.endpoint;
+  const list = pushSubs().filter((s) => s.sub.endpoint !== ep);
+  savePushSubs(list);
+  res.json({ ok: true, subscriptions: list.length });
+});
+
+app.put("/api/push/prefs", (req, res) => {
+  const incoming = req.body || {};
+  const next = { ...pushPrefs() };
+  ["train", "weigh", "unlogged", "adjusted"].forEach((k) => {
+    if (typeof incoming[k] === "boolean") next[k] = incoming[k];
+  });
+  ["morningHour", "eveningHour"].forEach((k) => {
+    const v = +incoming[k];
+    if (Number.isInteger(v) && v >= 0 && v <= 23) next[k] = v;
+  });
+  writeJson("push-prefs.json", next);
+  res.json({ ok: true, prefs: next });
+});
+
+app.post("/api/push/test", async (_req, res) => {
+  if (!pushSubs().length) return res.status(400).json({ error: "no devices subscribed" });
+  const out = await pushSend({
+    title: "Forge",
+    body: "Reminders are working. This is what they'll look like.",
+    tag: "forge-test",
+    url: "/",
+  });
+  res.json(out);
+});
+
+/* ---- reminder scheduler ----
+   Runs every 5 minutes and fires at most once per reminder per day. The
+   sent-log is keyed by local date so a restart can't double-send. */
+const hourInTz = () =>
+  +new Intl.DateTimeFormat("en-GB", { timeZone: TZNAME, hour: "2-digit", hourCycle: "h23" }).format(new Date());
+
+function alreadySent(key) {
+  const log = readJson("push-sent.json", {});
+  return !!log[key];
+}
+function markSent(key) {
+  const log = readJson("push-sent.json", {});
+  log[key] = Date.now();
+  // keep the file from growing forever
+  const keys = Object.keys(log).sort();
+  if (keys.length > 200) keys.slice(0, keys.length - 200).forEach((k) => delete log[k]);
+  writeJson("push-sent.json", log);
+}
+
+async function fireOnce(key, payload) {
+  if (alreadySent(key)) return false;
+  markSent(key); // mark first: a failed send is better than a doubled one
+  const out = await pushSend(payload);
+  console.log(`[push] ${key} -> ${out.sent} device(s)`);
+  return true;
+}
+
+async function pushCheck() {
+  try {
+    if (!pushSubs().length) return;
+    const due = dueReminders({
+      data: readJson("forge.json", null),
+      prefs: pushPrefs(),
+      today: dateInTz(),
+      idx: weekdayIdxInTz(),
+      hour: hourInTz(),
+    });
+    for (const r of due) await fireOnce(r.key, r.payload);
+  } catch (e) {
+    console.error("[push] scheduler failed:", String(e.message || e));
+  }
+}
+setInterval(pushCheck, 5 * 60 * 1000);
+setTimeout(pushCheck, 30 * 1000);
 
 /* ---- serve the built frontend ---- */
 app.use(express.static(path.join(__dirname, "dist")));

@@ -64,14 +64,65 @@ Extra env vars:
   `America/Argentina/Buenos_Aires`. Defaults to UTC.
 - `AUTO_ADJUST` — set to `off` to disable the background scheduler.
 
+## Reminders (push notifications)
+
+Turn them on in the You tab → Reminders. Four nudges, each toggleable:
+
+- **Training-day morning** — the day's focus and warm-up, at your chosen hour.
+  Suppressed once the session is logged.
+- **Monday weigh-in** — only if no bodyweight is logged that day.
+- **Evening, not logged** — a poke if a training day is still empty.
+- **Session adjusted** — fires when the background auto-adjust rewrites the day.
+
+Nothing to configure: the server generates a VAPID key pair on first boot and
+persists it to `vapid.json` on your volume. Set `VAPID_PUBLIC_KEY` /
+`VAPID_PRIVATE_KEY` only if you want to pin your own pair, and `VAPID_SUBJECT`
+(a `mailto:` or `https:` URL) if a push service asks for a contact.
+
+**On iPhone, notifications only reach installed apps.** Share → Add to Home
+Screen, open Forge from that icon, and the option appears. In a normal Safari
+tab the browser doesn't expose push at all — the app says so rather than
+offering a button that can't work.
+
+The scheduler runs every 5 minutes and sends each reminder at most once per
+local day (`TIMEZONE` decides when a day starts). Subscriptions the push
+service reports as gone are dropped automatically; transient failures are kept
+and retried.
+
 ## Architecture
 
 - `src/App.jsx` — the whole UI (plan, log, history, stats, gamification).
 - `server.js` — Express: serves the built frontend, stores data as JSON files
   in `/data` (or `./data` locally), and proxies `/api/claude` so your Anthropic
   key never reaches the browser.
-- Data files: `forge.json` (profile, workouts, plan, insights, body log) and
-  `exinfo.json` (cached exercise form guides).
+- `push-rules.js` — decides which reminders are due. Kept pure and separate
+  from the server so it can be tested without booting anything.
+- `public/sw.js` — service worker: offline caching plus the push and
+  notification-click handlers.
+- Data files: `forge.json` (profile, workouts, plan, insights, body log),
+  `exinfo.json` (cached exercise form guides), `vapid.json` (push keys),
+  `push-subs.json`, `push-prefs.json` and `push-sent.json`.
+
+## Tests
+
+```bash
+node test/strength-standards.mjs   # DOTS + standards maths, from the real App.jsx
+node test/push-rules.mjs           # which reminders fire, and when they don't
+node test/push-pruning.mjs         # dead subscriptions get dropped, flaky ones don't
+node test/sw-behaviour.mjs         # the worker never pins the app to an old build
+node test/photo-coverage.mjs       # exercise photo matcher
+```
+
+`photo-coverage` needs Babel: `npm i --no-save @babel/core @babel/preset-react
+@babel/preset-env`. `push-pruning` needs a throwaway TLS cert, since web-push
+refuses plain HTTP:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout /tmp/key.pem -out /tmp/cert.pem \
+  -days 2 -nodes -subj /CN=localhost
+```
+
+It skips cleanly if the cert isn't there.
 
 ## Notes
 
