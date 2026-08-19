@@ -283,6 +283,76 @@ const estimate1RM = (weight, reps) => {
   return Math.round(w * (1 + r / 30));
 };
 
+/* ---------- DOTS ----------
+   Bodyweight-normalised strength score used in modern powerlifting: it lets
+   a 62kg and a 105kg lifter compare totals directly. Polynomial coefficients
+   are the official IPF-adjacent DOTS set; the formula is only meaningful
+   inside the bodyweight range it was fitted to, so it returns null outside. */
+const DOTS_COEF = {
+  M: [-0.000001093, 0.0007391293, -0.1918759221, 24.0900756, -307.75076],
+  F: [-0.0000010706, 0.0005158568, -0.1126655495, 13.6175032, -57.96288],
+};
+const dotsScore = (totalKg, bwKg, sex) => {
+  const total = +totalKg || 0, raw = +bwKg || 0;
+  if (total <= 0 || raw <= 0) return null;
+  const female = sex === "F";
+  /* The polynomial was fitted to 40-210kg (40-150 for women) and goes
+     nonsensical outside it, so the official implementation clamps to the
+     boundary rather than extrapolating. Matching that keeps the score
+     comparable to any other DOTS calculator. */
+  const bw = Math.min(female ? 150 : 210, Math.max(40, raw));
+  const [a, b, c, d, e] = DOTS_COEF[female ? "F" : "M"];
+  const denom = a * bw ** 4 + b * bw ** 3 + c * bw ** 2 + d * bw + e;
+  if (denom <= 0) return null;
+  return Math.round((total * 500) / denom);
+};
+/* Rough interpretation bands for a squat+bench+deadlift DOTS. */
+const DOTS_BANDS = [
+  [200, "Untrained"], [250, "Beginner"], [300, "Novice"],
+  [350, "Intermediate"], [425, "Advanced"], [500, "Elite"], [Infinity, "World class"],
+];
+const dotsBand = (v) => (v == null ? null : (DOTS_BANDS.find(([n]) => v < n) || DOTS_BANDS[DOTS_BANDS.length - 1])[1]);
+
+/* ---------- strength standards ----------
+   Thresholds are bodyweight multiples for a 1RM, the widely used
+   ExRx-style bands. They are population averages, not a verdict: age,
+   limb length and training age all move them. */
+const LEVELS_5 = ["Beginner", "Novice", "Intermediate", "Advanced", "Elite"];
+const STANDARDS = {
+  //            beg   nov   int   adv   elite
+  Squat:    { M: [1.0, 1.25, 1.5, 2.25, 2.75], F: [0.6, 0.85, 1.1, 1.5, 2.0] },
+  Bench:    { M: [0.75, 1.0, 1.25, 1.75, 2.0], F: [0.4, 0.6, 0.75, 1.0, 1.35] },
+  Deadlift: { M: [1.25, 1.5, 1.75, 2.5, 3.0], F: [0.6, 1.0, 1.25, 1.75, 2.25] },
+  Press:    { M: [0.4, 0.6, 0.8, 1.1, 1.4], F: [0.25, 0.4, 0.55, 0.75, 1.0] },
+  Row:      { M: [0.6, 0.85, 1.1, 1.5, 1.8], F: [0.35, 0.5, 0.7, 0.95, 1.25] },
+};
+/* Returns where a lift sits on the ladder plus what the next rung costs,
+   which is the part that actually changes what you do on Monday. */
+const standardFor = (lift, kg, bwKg, sex) => {
+  const table = STANDARDS[lift];
+  const bw = +bwKg || 0, best = +kg || 0;
+  if (!table || bw <= 0 || best <= 0) return null;
+  const th = (table[sex === "F" ? "F" : "M"]).map((m) => m * bw);
+  let idx = -1;
+  for (let i = 0; i < th.length; i++) if (best >= th[i]) idx = i;
+  const next = idx + 1 < th.length ? th[idx + 1] : null;
+  const floor = idx >= 0 ? th[idx] : 0;
+  const ceil = next != null ? next : th[th.length - 1];
+  return {
+    lift,
+    kg: Math.round(best),
+    level: idx >= 0 ? LEVELS_5[idx] : "Untrained",
+    levelIdx: idx,
+    thresholds: th.map((v) => Math.round(v)),
+    nextLevel: next != null ? LEVELS_5[idx + 1] : null,
+    toNext: next != null ? Math.round(next - best) : 0,
+    /* progress across the whole ladder, for the bar */
+    pct: Math.max(0, Math.min(100, Math.round((best / th[th.length - 1]) * 100))),
+    /* progress within the current rung, for the "x kg to Advanced" line */
+    rungPct: ceil > floor ? Math.max(0, Math.min(100, Math.round(((best - floor) / (ceil - floor)) * 100))) : 100,
+  };
+};
+
 /* ---------- exercise photos (free-exercise-db, public domain) ----------
    Full 873-exercise catalog by name; ids derive from the name, so only the
    names ship. PREFERRED pins the lifts people log most to a hand-checked
@@ -717,6 +787,28 @@ const apiHeaders = () => ({
   ...(APP_TOKEN ? { "x-app-token": encodeURIComponent(APP_TOKEN) } : {}),
 });
 
+/* ---------- push notifications ----------
+   The VAPID key travels as base64url and has to be handed to the browser
+   as raw bytes. */
+const urlB64ToBytes = (b64) => {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+};
+/* iOS only delivers Web Push to an app launched from the Home Screen — in
+   Safari's normal tab PushManager is missing entirely, so telling the user
+   to install first is the only useful thing to say. */
+const isIOS = () =>
+  /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = () =>
+  window.navigator.standalone === true ||
+  (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+const pushSupported = () =>
+  "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+
 async function askClaude(prompt, maxTokens = 1500) {
   const res = await fetch("/api/claude", {
     method: "POST",
@@ -761,6 +853,10 @@ export default function Forge() {
   const [whoop, setWhoop] = useState(null);
   const [whoopConn, setWhoopConn] = useState(false);
   const [whoopErr, setWhoopErr] = useState("");
+  const [push, setPush] = useState({
+    key: null, subs: 0, on: false, busy: false, err: "", note: "",
+    prefs: { train: true, weigh: true, unlogged: true, adjusted: true, morningHour: 8, eveningHour: 20 },
+  });
   const [swapBusy, setSwapBusy] = useState(null);
   const [swapNote, setSwapNote] = useState("");
   const [addInj, setAddInj] = useState("");
@@ -831,6 +927,20 @@ export default function Forge() {
         if (c.ok) exCache.current = (await c.json()) || {};
       } catch (e) {}
       setLoaded(true);
+      try {
+        const pc = await fetch("/api/push/config", { headers: apiHeaders() });
+        if (pc.ok) {
+          const cfg = await pc.json();
+          let on = false;
+          if (pushSupported()) {
+            try {
+              const reg = await navigator.serviceWorker.ready;
+              on = !!(await reg.pushManager.getSubscription());
+            } catch (e) {}
+          }
+          setPush((p) => ({ ...p, key: cfg.publicKey, subs: cfg.subscriptions || 0, prefs: { ...p.prefs, ...(cfg.prefs || {}) }, on }));
+        }
+      } catch (e) {}
       try {
         const s = await fetch("/api/whoop/status", { headers: apiHeaders() });
         if (s.ok) {
@@ -1172,6 +1282,19 @@ export default function Forge() {
   const relStrength = bwNow > 0
     ? liftHistory.map((l) => ({ label: l.label, x: round1(l.best / bwNow * 100) / 100, kg: l.best, color: l.color }))
     : [];
+
+  // --- strength standards + DOTS ---
+  const sexKey = profile && profile.sex === "F" ? "F" : "M";
+  const standards = bwNow > 0
+    ? liftHistory
+        .map((l) => { const s = standardFor(l.label, l.best, bwNow, sexKey); return s ? { ...s, color: l.color } : null; })
+        .filter(Boolean)
+    : [];
+  /* DOTS needs a real squat+bench+deadlift total — a partial one would flatter
+     or punish the score for no reason, so it only shows with all three. */
+  const hasBig3 = bigThreeTotal.every((v) => v > 0);
+  const dots = hasBig3 && bwNow > 0 ? dotsScore(totalKgBig3, bwNow, sexKey) : null;
+  const dotsLevel = dotsBand(dots);
 
   // --- consistency heatmap (last ~26 weeks) ---
   const trainedDates = new Set(workouts.map((w) => w.date));
@@ -1582,7 +1705,8 @@ Athlete:
 - Reported sore today: ${todayCheckin.soreness.join(", ")} — avoid hammering these, or program them lightly.` : ""}${sorenessCount.length ? `
 - Frequently sore areas recently: ${sorenessCount.slice(0, 3).map(([g, n]) => `${g} (${n}x)`).join(", ")}.` : ""}${readinessLine ? `
 - Per-muscle readiness right now (estimated from set volume with a 38h fatigue half-life): ${readinessLine}.${fatiguedGroups.length ? ` Fatigued: ${fatiguedGroups.join(", ")} — do not program these hard in the first 1-2 days of the week; give them at least 48h before heavy work.` : ""}${readyGroups.length ? ` Ready to train hard: ${readyGroups.join(", ")} — front-load these early in the week.` : ""}` : ""}${RATIOS.filter((r) => r.verdict === "low").length ? `
-- Strength imbalances to address: ${RATIOS.filter((r) => r.verdict === "low").map((r) => r.label + " is low").join("; ")}. Bias volume toward the lagging lift.` : ""}${goalRange && repRanges.tot > 20 && repRanges.pct[goalRange] < 50 ? `
+- Strength imbalances to address: ${RATIOS.filter((r) => r.verdict === "low").map((r) => r.label + " is low").join("; ")}. Bias volume toward the lagging lift.` : ""}${standards.length ? `
+- Standards level per lift: ${standards.map((s2) => `${s2.lift} ${s2.level}${s2.nextLevel ? ` (${s2.toNext}kg short of ${s2.nextLevel})` : ""}`).join(", ")}. Program loads appropriate to that level, and where a lift is within a few kg of the next band, give it a chance to be tested this week.` : ""}${goalRange && repRanges.tot > 20 && repRanges.pct[goalRange] < 50 ? `
 - Rep-range mismatch: their goal calls for ${goalRange} reps but only ${repRanges.pct[goalRange]}% of sets are there. Correct this.` : ""}${stale.length ? `
 - Movements they have dropped for 3+ weeks: ${stale.map((e) => e.name).join(", ")}. Reintroduce if useful.` : ""}
 
@@ -1843,6 +1967,80 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
     setWhoopConn(false); setWhoop(null); setWhoopErr("");
   };
 
+  /* ----- reminders (web push) -----
+     Permission has to be requested inside the tap that asked for it, so this
+     runs straight off the button with no awaits before requestPermission. */
+  const enablePush = async () => {
+    setPush((p) => ({ ...p, busy: true, err: "", note: "" }));
+    const fail = (msg) => setPush((p) => ({ ...p, busy: false, err: msg }));
+    if (!pushSupported()) {
+      return fail(isIOS() && !isStandalone()
+        ? "On iPhone, reminders only work once Forge is on your Home Screen. Tap Share → Add to Home Screen, open it from there, then come back."
+        : "This browser doesn't support notifications.");
+    }
+    if (!push.key) return fail("The server hasn't sent its notification key yet. Reload and try again.");
+    let perm;
+    try { perm = await Notification.requestPermission(); } catch (e) { return fail("Couldn't ask for permission."); }
+    if (perm !== "granted") {
+      return fail(perm === "denied"
+        ? "Notifications are blocked for Forge. Turn them back on in your phone's settings for this app, then try again."
+        : "Permission wasn't granted.");
+    }
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = (await reg.pushManager.getSubscription())
+        || (await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlB64ToBytes(push.key),
+        }));
+      const r = await fetch("/api/push/subscribe", {
+        method: "POST", headers: apiHeaders(), body: JSON.stringify({ subscription: sub.toJSON() }),
+      });
+      if (!r.ok) return fail("The server rejected the subscription.");
+      const d = await r.json();
+      setPush((p) => ({ ...p, busy: false, on: true, subs: d.subscriptions || 1, note: "Reminders on for this device." }));
+    } catch (e) {
+      fail(String(e.message || e).slice(0, 180));
+    }
+  };
+
+  const disablePush = async () => {
+    setPush((p) => ({ ...p, busy: true, err: "", note: "" }));
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        await fetch("/api/push/unsubscribe", {
+          method: "POST", headers: apiHeaders(), body: JSON.stringify({ endpoint: sub.endpoint }),
+        });
+        await sub.unsubscribe();
+      }
+      setPush((p) => ({ ...p, busy: false, on: false, note: "Reminders off." }));
+    } catch (e) {
+      setPush((p) => ({ ...p, busy: false, err: String(e.message || e).slice(0, 180) }));
+    }
+  };
+
+  const testPush = async () => {
+    setPush((p) => ({ ...p, busy: true, err: "", note: "" }));
+    try {
+      const r = await fetch("/api/push/test", { method: "POST", headers: apiHeaders() });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || "send failed");
+      setPush((p) => ({ ...p, busy: false, note: `Sent to ${d.sent} device${d.sent === 1 ? "" : "s"}.` }));
+    } catch (e) {
+      setPush((p) => ({ ...p, busy: false, err: String(e.message || e).slice(0, 180) }));
+    }
+  };
+
+  const setPushPref = async (patch) => {
+    const next = { ...push.prefs, ...patch };
+    setPush((p) => ({ ...p, prefs: next }));
+    try {
+      await fetch("/api/push/prefs", { method: "PUT", headers: apiHeaders(), body: JSON.stringify(next) });
+    } catch (e) {}
+  };
+
   /* ----- daily auto-adjust to recovery ----- */
   const adjustToday = async (w = whoop) => {
     if (!plan || !plan.week || !w || w.recovery == null) return;
@@ -1959,6 +2157,7 @@ ${(profile.injuries || []).length ? `Injuries/limitations: ${profile.injuries.jo
 ` : ""}${avgRpe ? `Average RPE ${avgRpe} across ${rpeEntries.length} rated sets.
 ` : ""}${RATIOS.length ? `Strength ratios: ${RATIOS.map((r) => `${r.label} ${r.val} (ref ${r.ref}, ${r.verdict})`).join("; ")}.
 ` : ""}${relStrength.length ? `Relative strength at ${bwNow}kg: ${relStrength.map((r) => `${r.label} ${r.x}x bw`).join(", ")}.
+` : ""}${standards.length ? `Strength standards: ${standards.map((s2) => `${s2.lift} ${s2.level}${s2.nextLevel ? ` (${s2.toNext}kg from ${s2.nextLevel})` : ""}`).join(", ")}.${dots != null ? ` DOTS ${dots} (${dotsLevel}).` : ""}
 ` : ""}${repRanges.tot ? `Rep-range split: ${repRanges.pct["1-5"]}% heavy (1-5), ${repRanges.pct["6-12"]}% moderate, ${repRanges.pct["13+"]}% light.
 ` : ""}${stale.length ? `Dropped movements (3+ weeks): ${stale.map((e) => e.name).join(", ")}.
 ` : ""}${recoveryVsVolume.length >= 4 ? `Recovery-vs-volume correlation r=${pearson(recoveryVsVolume)} over ${recoveryVsVolume.length} sessions.
@@ -2540,6 +2739,93 @@ Respond ONLY with valid JSON, no markdown fences:
                     <p style={{ color: T.sub, fontSize: 13 }}>Connected — data syncs on load.</p>
                   )}
                   <button style={{ ...S.ghost, width: "100%" }} onClick={disconnectWhoop}>Disconnect</button>
+                </>
+              )}
+            </div>
+          )}
+
+          {profile && (
+            <div style={S.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <Rule label="Reminders" />
+                {push.on && <span style={{ fontSize: 12, color: T.good, fontWeight: 700 }}>● on</span>}
+              </div>
+              {isIOS() && !isStandalone() ? (
+                <p style={{ color: T.sub, fontSize: 13, margin: 0, lineHeight: 1.6 }}>
+                  iPhone only delivers notifications to installed apps. Tap <b style={{ color: T.text }}>Share → Add to
+                  Home Screen</b>, open Forge from that icon, and this option will appear here.
+                </p>
+              ) : (
+                <>
+                  {!push.on ? (
+                    <p style={{ color: T.sub, fontSize: 13, marginTop: 0 }}>
+                      A nudge on training mornings, a Monday weigh-in prompt, and a poke in the evening if the session
+                      never got logged. Nothing else.
+                    </p>
+                  ) : (
+                    <>
+                      {[
+                        ["train", "Training-day morning nudge"],
+                        ["weigh", "Monday weigh-in"],
+                        ["unlogged", "Evening: session not logged"],
+                        ["adjusted", "When recovery changes your session"],
+                      ].map(([k, label], i, arr) => (
+                        <Row key={k} last={i === arr.length - 1} onClick={() => setPushPref({ [k]: !push.prefs[k] })}>
+                          <span style={{ flex: 1, fontSize: 13.5 }}>{label}</span>
+                          <span style={{
+                            width: 40, height: 22, borderRadius: 12, flexShrink: 0, position: "relative",
+                            background: push.prefs[k] ? T.accentDim : T.surface2,
+                            border: `1px solid ${push.prefs[k] ? T.accent : T.line}`,
+                          }}>
+                            <span style={{
+                              position: "absolute", top: 3, left: push.prefs[k] ? 21 : 3,
+                              width: 14, height: 14, borderRadius: 7,
+                              background: push.prefs[k] ? T.accent : T.dim,
+                            }} />
+                          </span>
+                        </Row>
+                      ))}
+                      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                        {[["morningHour", "Morning"], ["eveningHour", "Evening"]].map(([k, l]) => (
+                          <div key={k} style={{ flex: 1 }}>
+                            <span style={S.label}>{l}</span>
+                            <select style={{ ...S.input, appearance: "none" }} value={push.prefs[k]}
+                              onChange={(e) => setPushPref({ [k]: +e.target.value })}>
+                              {Array.from({ length: 24 }).map((_, h) => (
+                                <option key={h} value={h}>{String(h).padStart(2, "0")}:00</option>
+                              ))}
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                  <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                    {!push.on ? (
+                      <button style={{ ...S.btn, flex: 1 }} disabled={push.busy} onClick={enablePush}>
+                        {push.busy ? "Enabling…" : "Turn on reminders"}
+                      </button>
+                    ) : (
+                      <>
+                        <button style={{ ...S.ghost, flex: 1 }} disabled={push.busy} onClick={testPush}>Send a test</button>
+                        <button style={{ ...S.ghost, flex: 1 }} disabled={push.busy} onClick={disablePush}>Turn off</button>
+                      </>
+                    )}
+                  </div>
+                  {push.note && <div style={{ fontSize: 12.5, color: T.good, marginTop: 10 }}>{push.note}</div>}
+                  {push.err && (
+                    <div style={{
+                      marginTop: 10, fontSize: 12.5, lineHeight: 1.5, color: T.red,
+                      background: T.redDim, borderLeft: `2px solid ${T.red}`, borderRadius: 8, padding: "10px 12px",
+                    }}>
+                      {push.err}
+                    </div>
+                  )}
+                  {push.on && push.subs > 1 && (
+                    <div style={{ fontSize: 11.5, color: T.dim, marginTop: 8 }}>
+                      {push.subs} devices are subscribed. Reminders go to all of them.
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -3612,6 +3898,62 @@ Respond ONLY with valid JSON, no markdown fences:
                     </div>
                   ))}
                   <div style={{ fontSize: 11.5, color: T.dim, marginTop: 6 }}>Ticks mark 1×, 1.5× and 2× bodyweight.</div>
+                </div>
+              )}
+
+              {standards.length > 0 && (
+                <div style={S.card}>
+                  <Rule label="Strength standards" right={`${sexKey === "F" ? "female" : "male"} · ${bwNow} kg`} />
+                  {dots != null && (
+                    <div style={{
+                      display: "flex", alignItems: "center", gap: 12, marginBottom: 14,
+                      background: T.surface2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "11px 13px",
+                    }}>
+                      <div>
+                        <div style={{ ...mono, fontSize: 24, fontWeight: 500, letterSpacing: "-0.03em", color: T.gold, lineHeight: 1.1 }}>{dots}</div>
+                        <div style={S.tileLab}>DOTS</div>
+                      </div>
+                      <div style={{ flex: 1, fontSize: 12.5, color: T.sub, lineHeight: 1.5 }}>
+                        <b style={{ color: T.text }}>{dotsLevel}</b> for a {Math.round(totalKgBig3)} kg big-three total
+                        at {bwNow} kg. One number that compares across bodyweights.
+                      </div>
+                    </div>
+                  )}
+                  {standards.map((s) => {
+                    const seg = Math.min(4, s.levelIdx + 1);
+                    const markerPct = Math.min(100, ((seg + s.rungPct / 100) / 5) * 100);
+                    return (
+                      <div key={s.lift} style={{ marginBottom: 13 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", fontSize: 12.5, marginBottom: 4 }}>
+                          <span>{s.lift} <span style={{ ...mono, color: T.dim }}>{s.kg}kg</span></span>
+                          <span style={{
+                            fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700,
+                            color: s.levelIdx >= 3 ? T.good : s.levelIdx >= 1 ? T.gold : T.sub,
+                          }}>{s.level}</span>
+                        </div>
+                        <div style={{ position: "relative", height: 9, background: T.surface2, borderRadius: 4 }}>
+                          <div style={{ width: `${markerPct}%`, height: "100%", background: s.color, borderRadius: 4, opacity: 0.85 }} />
+                          {[1, 2, 3, 4].map((i) => (
+                            <span key={i} style={{
+                              position: "absolute", left: `${i * 20}%`, top: -1, width: 1, height: 11, background: T.bg,
+                            }} />
+                          ))}
+                        </div>
+                        <div style={{ fontSize: 11, color: T.dim, marginTop: 4 }}>
+                          {s.nextLevel
+                            ? <><b style={{ ...mono, color: T.text }}>{s.toNext} kg</b> to {s.nextLevel} <span style={{ ...mono }}>({s.thresholds[s.levelIdx + 1]}kg)</span></>
+                            : "Top of the scale."}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: T.dim, textTransform: "uppercase", letterSpacing: "0.06em", marginTop: 2 }}>
+                    {LEVELS_5.map((l) => <span key={l} style={{ flex: 1, textAlign: "center" }}>{l.slice(0, 3)}</span>)}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: T.dim, marginTop: 10, lineHeight: 1.5 }}>
+                    Bands are bodyweight multiples of your estimated 1RM against typical population standards.
+                    They're a reference point, not a report card — leverages and training age move them.
+                  </div>
                 </div>
               )}
 
