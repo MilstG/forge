@@ -7,7 +7,7 @@
  *
  * Bump CACHE on any change here so activate() clears the old one.
  */
-const CACHE = "forge-v2";
+const CACHE = "forge-v3";
 
 self.addEventListener("install", (e) => {
   e.waitUntil(
@@ -27,6 +27,40 @@ self.addEventListener("activate", (e) => {
 
 self.addEventListener("message", (e) => {
   if (e.data === "skip-waiting") self.skipWaiting();
+});
+
+/* ---- push notifications ----
+   The payload is JSON from the server. iOS requires every push to be
+   user-visible, so a malformed payload still shows something rather than
+   silently burning the subscription's trust budget. */
+self.addEventListener("push", (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (err) { d = { body: e.data ? e.data.text() : "" }; }
+  const title = d.title || "Forge";
+  e.waitUntil(
+    self.registration.showNotification(title, {
+      body: d.body || "",
+      tag: d.tag || "forge",
+      renotify: true,
+      icon: "/icon-192.png",
+      badge: "/icon-192.png",
+      data: { url: d.url || "/" },
+    })
+  );
+});
+
+/* Focus an open tab if there is one, otherwise open the app. */
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  const target = (e.notification.data && e.notification.data.url) || "/";
+  e.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+      for (const c of list) {
+        if (c.url.includes(self.location.origin) && "focus" in c) return c.focus();
+      }
+      return self.clients.openWindow(target);
+    })
+  );
 });
 
 const isHTML = (req) =>
