@@ -91,7 +91,8 @@ and retried.
 
 ## Architecture
 
-- `src/App.jsx` — the whole UI (plan, log, history, stats, gamification).
+- `src/App.jsx` — the UI (plan, log, history, stats, gamification).
+- `src/lib/` — plan sanitising, progression, constraints, WHOOP signals, coach write-path.
 - `server.js` — Express: serves the built frontend, stores data as JSON files
   in `/data` (or `./data` locally), and proxies `/api/claude` so your Anthropic
   key never reaches the browser.
@@ -111,6 +112,10 @@ node test/push-rules.mjs           # which reminders fire, and when they don't
 node test/push-pruning.mjs         # dead subscriptions get dropped, flaky ones don't
 node test/sw-behaviour.mjs         # the worker never pins the app to an old build
 node test/photo-coverage.mjs       # exercise photo matcher
+node test/coach-write.mjs          # auto-adjust / rewrite never touch logged days
+node test/progression.mjs          # deterministic next-set rules
+node test/plan-schema.mjs          # coach JSON is sanitised against constraints
+node test/deload-whoop.mjs         # deload detection + strain budget
 ```
 
 `photo-coverage` needs Babel: `npm i --no-save @babel/core @babel/preset-react
@@ -127,4 +132,10 @@ It skips cleanly if the cert isn't there.
 ## Notes
 
 - Single-user by design. The password is a shared secret, not accounts.
+  Change it in the You tab — that writes `auth.json` and does not need a redeploy.
+  After login the browser holds an httpOnly session cookie so the password is
+  not sent on every request (`x-app-token` still works).
+- Plan and delete snapshots live in `forge-history.json` (last 20). Undo last
+  plan change from the Plan tab.
+- Boot warns if `/data` is missing or not writable (`GET /api/health`).
 - To back up your data, copy `forge.json` off the volume.

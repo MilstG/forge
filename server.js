@@ -1,9 +1,14 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import webpush from "web-push";
 import { dueReminders, DEFAULT_PUSH_PREFS } from "./push-rules.js";
+import { canAutoAdjust, applyAutoAdjust } from "./src/lib/coach-write.js";
+import { sanitizePlan } from "./src/lib/plan-schema.js";
+import { adjustReason } from "./src/lib/whoop-signal.js";
+import { constraintBlock } from "./src/lib/constraints.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -12,39 +17,118 @@ app.use(express.json({ limit: "4mb" }));
 /* ---- persistence: JSON files on a mounted volume ----
    On Railway, attach a volume mounted at /data so your log
    survives restarts and redeploys. Falls back to ./data locally. */
+const VOLUME_MOUNTED = fs.existsSync("/data");
 const DATA_DIR =
-  process.env.DATA_DIR || (fs.existsSync("/data") ? "/data" : path.join(__dirname, "data"));
-fs.mkdirSync(DATA_DIR, { recursive: true });
+  process.env.DATA_DIR || (VOLUME_MOUNTED ? "/data" : path.join(__dirname, "data"));
+let dataDirWritable = true;
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(path.join(DATA_DIR, ".write-check"), String(Date.now()));
+} catch (e) {
+  dataDirWritable = false;
+  console.error("[data] DATA_DIR is not writable:", DATA_DIR, String(e.message || e));
+}
 const fileFor = (name) => path.join(DATA_DIR, name);
 const readJson = (f, fallback) => {
   try { return JSON.parse(fs.readFileSync(fileFor(f), "utf8")); } catch { return fallback; }
 };
 const writeJson = (f, data) => {
+  if (!dataDirWritable) throw new Error("data directory is not writable");
   const tmp = fileFor(f + ".tmp");
   fs.writeFileSync(tmp, JSON.stringify(data));
   fs.renameSync(tmp, fileFor(f)); // atomic-ish write
 };
 
-/* ---- simple password gate for all API routes ----
-   The token travels in a header, so it is percent-encoded by the client
-   (HTTP headers can't carry non-ASCII, e.g. accented characters).
-   Values are trimmed because env vars often pick up stray whitespace. */
-const PASSWORD = (process.env.APP_PASSWORD || "").trim();
-const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth"]);
+/* ---- auth: env password, optional override in auth.json, session cookie ----
+   x-app-token still works. After login the browser holds an httpOnly cookie
+   so the password is not resent on every request. Change-password writes
+   auth.json and does not require a redeploy. */
+const ENV_PASSWORD = (process.env.APP_PASSWORD || "").trim();
+const authFile = () => readJson("auth.json", { sessions: [] });
+const currentPassword = () => (authFile().password || ENV_PASSWORD).trim();
+const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth", "/auth/login", "/health"]);
+const parseCookies = (req) => {
+  const out = {};
+  String(req.headers.cookie || "").split(";").forEach((p) => {
+    const i = p.indexOf("=");
+    if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
+  });
+  return out;
+};
 const tokenMatches = (raw) => {
-  if (!PASSWORD) return true;
+  const pw = currentPassword();
+  if (!pw) return true;
   if (!raw) return false;
   const candidates = [String(raw).trim()];
   try { candidates.push(decodeURIComponent(String(raw)).trim()); } catch (e) {}
   try { candidates.push(Buffer.from(String(raw), "base64").toString("utf8").trim()); } catch (e) {}
-  return candidates.includes(PASSWORD);
+  return candidates.includes(pw);
+};
+const sessionOk = (req) => {
+  const tok = parseCookies(req).forge_session;
+  if (!tok) return false;
+  const sessions = authFile().sessions || [];
+  return sessions.some((s) => s.token === tok && (!s.exp || s.exp > Date.now()));
 };
 app.use("/api", (req, res, next) => {
-  if (OPEN_PATHS.has(req.path)) return next(); // OAuth redirect + non-sensitive diagnostics
-  if (!tokenMatches(req.headers["x-app-token"])) {
+  if (OPEN_PATHS.has(req.path)) return next();
+  if (sessionOk(req) || tokenMatches(req.headers["x-app-token"])) return next();
+  return res.status(401).json({ error: "unauthorized" });
+});
+
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: dataDirWritable,
+    data_dir: DATA_DIR,
+    writable: dataDirWritable,
+    volume_mounted: VOLUME_MOUNTED,
+    using_local_fallback: !VOLUME_MOUNTED,
+    warning: !dataDirWritable
+      ? "Data directory is not writable — logs will not persist."
+      : !VOLUME_MOUNTED
+        ? "No /data volume mounted. Redeploys will wipe local ./data."
+        : null,
+  });
+});
+
+const cookieFlags = () => {
+  const secure = process.env.APP_URL ? "Secure; " : "";
+  return `HttpOnly; ${secure}SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 30}`;
+};
+app.post("/api/auth/login", (req, res) => {
+  const pw = String((req.body && req.body.password) || "").trim();
+  if (currentPassword() && pw !== currentPassword()) {
     return res.status(401).json({ error: "unauthorized" });
   }
-  next();
+  const token = crypto.randomBytes(24).toString("hex");
+  const auth = authFile();
+  auth.sessions = (auth.sessions || []).filter((s) => s.exp > Date.now()).slice(-8);
+  auth.sessions.push({ token, exp: Date.now() + 30 * 24 * 3600 * 1000, at: Date.now() });
+  writeJson("auth.json", auth);
+  res.setHeader("Set-Cookie", `forge_session=${token}; ${cookieFlags()}`);
+  res.json({ ok: true, session: true });
+});
+app.post("/api/auth/logout", (req, res) => {
+  const tok = parseCookies(req).forge_session;
+  const auth = authFile();
+  auth.sessions = (auth.sessions || []).filter((s) => s.token !== tok);
+  writeJson("auth.json", auth);
+  res.setHeader("Set-Cookie", "forge_session=; HttpOnly; Path=/; Max-Age=0");
+  res.json({ ok: true });
+});
+app.post("/api/auth/password", (req, res) => {
+  const current = String((req.body && req.body.current) || "").trim();
+  const next = String((req.body && req.body.next) || "").trim();
+  if (!next || next.length < 4) return res.status(400).json({ error: "new password too short" });
+  if (currentPassword() && current !== currentPassword()) {
+    return res.status(401).json({ error: "current password does not match" });
+  }
+  const auth = authFile();
+  auth.password = next;
+  auth.sessions = []; // force re-login
+  writeJson("auth.json", auth);
+  res.setHeader("Set-Cookie", "forge_session=; HttpOnly; Path=/; Max-Age=0");
+  res.json({ ok: true });
 });
 
 /* ---- WHOOP integration (OAuth 2.0, v2 API) ----
@@ -89,9 +173,9 @@ app.post("/api/whoop/auth-url", (req, res) => {
 app.get("/api/whoop/diag", (req, res) => {
   const t = readJson("whoop.json", null);
   res.json({
-    password_protected: !!PASSWORD,
-    password_length: PASSWORD ? PASSWORD.length : 0,
-    password_is_ascii: PASSWORD ? /^[\x20-\x7E]*$/.test(PASSWORD) : true,
+    password_protected: !!currentPassword(),
+    password_length: currentPassword() ? currentPassword().length : 0,
+    password_is_ascii: currentPassword() ? /^[\x20-\x7E]*$/.test(currentPassword()) : true,
     client_id_set: !!process.env.WHOOP_CLIENT_ID,
     client_secret_set: !!process.env.WHOOP_CLIENT_SECRET,
     app_url_env: process.env.APP_URL || null,
@@ -251,11 +335,49 @@ app.post("/api/whoop/disconnect", (_req, res) => {
   res.json({ ok: true });
 });
 
-/* ---- data endpoints ---- */
+/* ---- data endpoints + plan/data snapshots ---- */
+const snapshotPush = (reason, data) => {
+  try {
+    const hist = readJson("forge-history.json", []);
+    hist.push({
+      at: Date.now(),
+      reason: reason || "save",
+      data: {
+        profile: data.profile,
+        plan: data.plan,
+        workouts: data.workouts,
+        live: data.live,
+        reviewedWeek: data.reviewedWeek,
+      },
+    });
+    writeJson("forge-history.json", hist.slice(-20));
+  } catch (e) {
+    console.error("[snapshot]", String(e.message || e));
+  }
+};
+
 app.get("/api/data", (_req, res) => res.json(readJson("forge.json", {})));
 app.put("/api/data", (req, res) => {
-  writeJson("forge.json", req.body || {});
-  res.json({ ok: true });
+  const incoming = req.body || {};
+  const prev = readJson("forge.json", {});
+  const planChanged = JSON.stringify(prev.plan || null) !== JSON.stringify(incoming.plan || null);
+  const deletedWorkout = (prev.workouts || []).length > (incoming.workouts || []).length;
+  if (planChanged || deletedWorkout) snapshotPush(planChanged ? "plan" : "workout-delete", prev);
+  writeJson("forge.json", incoming);
+  res.json({ ok: true, snapshotted: planChanged || deletedWorkout });
+});
+app.get("/api/data/history", (_req, res) => {
+  const hist = readJson("forge-history.json", []);
+  res.json(hist.map((h, i) => ({ i, at: h.at, reason: h.reason })));
+});
+app.post("/api/data/undo", (req, res) => {
+  const hist = readJson("forge-history.json", []);
+  const last = hist.pop();
+  if (!last) return res.status(400).json({ error: "nothing to undo" });
+  const current = readJson("forge.json", {});
+  writeJson("forge.json", { ...current, ...last.data });
+  writeJson("forge-history.json", hist);
+  res.json({ ok: true, restored: last.reason, at: last.at, data: { ...current, ...last.data } });
 });
 app.get("/api/exinfo", (_req, res) => res.json(readJson("exinfo.json", {})));
 app.put("/api/exinfo", (req, res) => {
@@ -460,9 +582,9 @@ async function autoAdjustCheck() {
     if (!data || !data.profile || !data.plan || !Array.isArray(data.plan.week)) return;
     const today = dateInTz();
     const idx = weekdayIdxInTz();
-    if (idx < 0 || data.plan.adjustedDate === today) return;      // already handled today
+    if (idx < 0) return;
+    if (!canAutoAdjust({ plan: data.plan, workouts: data.workouts, today, todayIdx: idx })) return;
     const dy = data.plan.week[idx];
-    if (!dy || dy.rest || !dy.exercises || !dy.exercises.length) return;
 
     const sum = await fetchWhoopSummary();
     if (!sum || sum.recovery == null) return;                      // WHOOP not connected / no data
@@ -477,36 +599,37 @@ async function autoAdjustCheck() {
     }
 
     const p = data.profile;
+    const reason = adjustReason(sum);
     const gearLabels = (p.gear || []).length ? p.gear.map((g) => GEAR_LABELS[g] || g) : ["Bodyweight only"];
     const prompt = `Adjust today's planned training session to the athlete's recovery. Change only what recovery demands.
 
-Athlete: ${p.level}, goal ${p.goal}.${(p.injuries || []).length ? ` Injuries: ${p.injuries.join("; ")}.` : ""}
+Athlete: ${p.level}, goal ${p.goal}.${constraintBlock(p)}
 Equipment: ${gearLabels.join(", ")}.
-WHOOP today: recovery ${sum.recovery}%, HRV ${sum.hrv} ms, RHR ${sum.rhr} bpm, sleep ${sum.sleepHours}h, yesterday's strain ${sum.strain}.
+WHOOP today: ${reason.summary}.
 Planned session: ${JSON.stringify(dy)}
 
 Rules:
-- Recovery under 34% (red): cut loads 20-30%, drop roughly one set per exercise, and swap the most CNS-taxing lifts (heavy squats/deadlifts) for gentler variants.
+- Recovery under 34% (red): cut loads 20-30%, drop roughly one set per exercise${p.neverSwapCompounds ? "." : ", and swap the most CNS-taxing lifts (heavy squats/deadlifts) for gentler variants."}
 - Recovery 34-66% (yellow): trim loads about 10% and reduce total sets slightly. Keep the session's structure.
 - Keep the same day name and a similar exercise count. Use ONLY the available equipment.
+${p.neverSwapCompounds ? "- Do NOT replace squat/bench/deadlift/press/row — only change load, sets or reps." : ""}
 
 Respond ONLY with valid JSON, no markdown fences:
 {"day":"${dy.day}","rest":false,"focus":"session title","warmup":"one line warm-up for this session","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
 
     const text = await callAI(prompt, 1200);
     const adj = JSON.parse(text.replace(/```json|```/g, "").trim());
-    data.plan.originalDay = { idx, day: dy };
-    data.plan.week[idx] = {
-      day: adj.day || dy.day, rest: false,
-      focus: adj.focus || dy.focus, warmup: adj.warmup || dy.warmup,
-      exercises: adj.exercises || dy.exercises,
-    };
-    data.plan.adjustedDate = today;
-    data.plan.adjustNote = adj.adjust_note || "Adjusted to today's recovery.";
-    data.plan.adjustRecovery = sum.recovery;
+    const sanitized = sanitizePlan({ why: "", tip: "", week: data.plan.week.map((d, i) => i === idx ? adj : d) }, { profile: p });
+    snapshotPush("auto-adjust", data);
+    data.plan = applyAutoAdjust(data.plan, {
+      ...adj,
+      exercises: sanitized.week[idx].exercises,
+      adjustRecovery: sum.recovery,
+      adjustReason: reason.summary,
+    }, { today, todayIdx: idx, neverSwapCompounds: !!p.neverSwapCompounds });
     delete data.plan.adjustUndone;
     writeJson("forge.json", data);
-    console.log(`[auto-adjust] ${today}: ${dy.day} adjusted for recovery ${sum.recovery}%`);
+    console.log(`[auto-adjust] ${today}: ${dy.day} adjusted for ${reason.summary}`);
   } catch (e) {
     console.error("[auto-adjust] failed:", String(e.message || e));
   }
