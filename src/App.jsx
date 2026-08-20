@@ -1,4 +1,9 @@
 import { useState, useEffect, useRef } from "react";
+import { sanitizePlan } from "./lib/plan-schema.js";
+import { constraintBlock } from "./lib/constraints.js";
+import { applyPlanRewrite, canAutoAdjust, applyAutoAdjust } from "./lib/coach-write.js";
+import { suggestFromHistory, bumpWeight } from "./lib/progression.js";
+import { adjustReason, strainBudget } from "./lib/whoop-signal.js";
 
 /* ================= design tokens =================
    Direction: machinist's instrument panel. Warm near-black surfaces,
@@ -414,7 +419,7 @@ const photoFor = (name) => {
 };
 
 /* Start/finish photo pair; falls back to the animated pictogram. */
-const ExPhoto = ({ name, fallback = null }) => {
+const ExPhoto = ({ name, fallback = null, rejected = false, onReject }) => {
   const pair = photoFor(name);
   const [frame, setFrame] = useState(0);
   const [dead, setDead] = useState(false);
@@ -426,7 +431,16 @@ const ExPhoto = ({ name, fallback = null }) => {
     const t = setInterval(() => setFrame((f) => 1 - f), 1600);
     return () => clearInterval(t);
   }, [name, dead]);
-  if (!pair || dead) return fallback;
+  if (rejected || !pair || dead) {
+    return (
+      <div>
+        {fallback}
+        {dead && !rejected && (
+          <div style={{ fontSize: 12, color: T.sub, margin: "0 0 12px" }}>Photo unavailable — using the pictogram.</div>
+        )}
+      </div>
+    );
+  }
   return (
     <div style={{
       position: "relative", width: "100%", aspectRatio: "4 / 3", marginBottom: 14,
@@ -444,6 +458,14 @@ const ExPhoto = ({ name, fallback = null }) => {
         background: "rgba(11,12,15,0.72)", padding: "3px 9px", borderRadius: 999,
         fontFamily: FD, textTransform: "uppercase", letterSpacing: "0.1em",
       }}>{frame === 0 ? "Start" : "Finish"}</div>
+      {onReject && (
+        <button onClick={(e) => { e.stopPropagation(); onReject(name); }}
+          style={{
+            position: "absolute", top: 8, right: 8, fontSize: 11, color: T.text,
+            background: "rgba(11,12,15,0.72)", border: "none", padding: "4px 9px",
+            borderRadius: 999, cursor: "pointer",
+          }}>Wrong photo</button>
+      )}
     </div>
   );
 };
@@ -860,6 +882,14 @@ export default function Forge() {
   const [swapBusy, setSwapBusy] = useState(null);
   const [swapNote, setSwapNote] = useState("");
   const [addInj, setAddInj] = useState("");
+  const [addAvoid, setAddAvoid] = useState("");
+  const [addPrefer, setAddPrefer] = useState("");
+  const [health, setHealth] = useState(null);
+  const [pwNext, setPwNext] = useState("");
+  const [pwCur, setPwCur] = useState("");
+  const [pwNote, setPwNote] = useState("");
+  const [strainNote, setStrainNote] = useState("");
+  const [undoNote, setUndoNote] = useState("");
   const [adjBusy, setAdjBusy] = useState(false);
   const autoAdj = useRef(false);
   const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
@@ -873,6 +903,8 @@ export default function Forge() {
     age: "", sex: "M", height: "", weight: "",
     goal: GOALS[0], specific: "", level: LEVELS[0], days: 3, gear: ["barbell", "dumbbells"],
     injuries: [],
+    avoid: [], prefer: [], constraintNotes: "", neverSwapCompounds: false,
+    photoRejects: {},
   });
   const setDF = (k, v) => setD((p) => ({ ...p, [k]: v }));
 
@@ -942,6 +974,10 @@ export default function Forge() {
         }
       } catch (e) {}
       try {
+        const hz = await fetch("/api/health");
+        if (hz.ok) setHealth(await hz.json());
+      } catch (e) {}
+      try {
         const s = await fetch("/api/whoop/status", { headers: apiHeaders() });
         if (s.ok) {
           const st = await s.json();
@@ -962,14 +998,18 @@ export default function Forge() {
     if (!val) return;
     setPwErr("");
     try {
+      await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: val }),
+      });
       const r = await fetch("/api/data", {
         headers: { "Content-Type": "application/json", "x-app-token": encodeURIComponent(val) },
       });
       if (r.status === 401) { setPwErr("That password doesn't match. Check the APP_PASSWORD variable in Railway."); return; }
       if (!r.ok) { setPwErr("Server error — try again in a moment."); return; }
       try { localStorage.setItem("forge-token", val); } catch (e) {
-        setPwErr("This browser is blocking local storage, so the password can't be saved. Turn off private browsing.");
-        return;
+        /* cookie session still works even if storage is blocked */
       }
       window.location.reload();
     } catch (e) {
@@ -1459,11 +1499,45 @@ export default function Forge() {
     return null;
   };
   // RPE-aware progression: hard last time → hold, easy → bigger jump
-  const suggestNext = (perf) => {
+  const suggestNext = (perf, name) => {
+    if (name) {
+      const hist = [];
+      for (const w of workouts) {
+        const e = w.exercises.find((x) => x.name.trim().toLowerCase() === name.trim().toLowerCase());
+        if (e && +e.weight) hist.push({ weight: +e.weight, reps: +e.reps || 0, rpe: +e.rpe || 0, targetReps: +e.reps || 0, date: w.date });
+      }
+      const fromH = suggestFromHistory(hist);
+      if (fromH) return fromH.weight;
+    }
     if (!perf || !perf.weight) return null;
     const r = +perf.rpe || 0;
     const step = r >= 9.5 ? 0 : r >= 8.5 ? 1.25 : r > 0 && r <= 6 ? 5 : 2.5;
     return Math.round((perf.weight + step) * 2) / 2;
+  };
+
+  const undoLastMutation = async () => {
+    try {
+      const r = await fetch("/api/data/undo", { method: "POST", headers: apiHeaders() });
+      const d2 = await r.json();
+      if (!r.ok) { setUndoNote(d2.error || "nothing to undo"); return; }
+      const data = d2.data || {};
+      if (data.plan) setPlan(data.plan);
+      if (data.workouts) setWorkouts(data.workouts);
+      if (data.profile) { setProfile(data.profile); setD(data.profile); }
+      setUndoNote("Restored previous snapshot");
+      setTimeout(() => setUndoNote(""), 2500);
+    } catch (e) {
+      setUndoNote("Undo failed");
+    }
+  };
+
+  const rejectPhoto = (name) => {
+    const key = (name || "").trim().toLowerCase();
+    if (!key) return;
+    const photoRejects = { ...(d.photoRejects || profile.photoRejects || {}), [key]: true };
+    const p = { ...(profile || d), photoRejects };
+    setProfile(p); setD((x) => ({ ...x, photoRejects }));
+    persist({ profile: p });
   };
 
   /* ----- rest timer duration by goal ----- */
@@ -1697,8 +1771,7 @@ Athlete:
 - Age ${p.age || "?"}, sex ${p.sex}, height ${p.height || "?"} cm, weight ${p.weight || "?"} kg
 - Experience: ${p.level}. Wants to train ${p.days} days/week.
 - Main goal: ${p.goal}. Specific goals in their own words: "${p.specific || "none given"}"
-- Available equipment: ${gearLabels.join(", ")}${(p.injuries || []).length ? `
-- Injuries / limitations: ${p.injuries.join("; ")} — avoid movements that aggravate these and pick safe alternatives.` : ""}${whoop && whoop.recovery != null ? `
+- Available equipment: ${gearLabels.join(", ")}${constraintBlock(p)}${whoop && whoop.recovery != null ? `
 - Today's WHOOP: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr} bpm, sleep ${whoop.sleepHours}h${whoop.sleepPerf ? ` (${whoop.sleepPerf}% performance)` : ""}, yesterday's strain ${whoop.strain}. Calibrate intensity to recovery: under 34% go much lighter, 34-66% moderate, above 66% full intensity.` : ""}${bc.ctx}
 - Recent workouts (most recent first, rpe is 1-10 perceived effort where given): ${JSON.stringify(recent)}${avgRpe ? `
 - Average logged RPE: ${avgRpe}. If recent RPE at given loads is 9+, hold or reduce load rather than adding weight; if 6 or below, add a larger jump.` : ""}${todayCheckin && (todayCheckin.soreness || []).length ? `
@@ -1727,7 +1800,13 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
     try {
       const clean = await askClaude(prompt, 2500);
       const parsed = parseJson(clean);
-      const withMeta = { ...parsed, created: todayStr };
+      const sanitized = sanitizePlan(parsed, {
+        profile: p,
+        libNames: LIB.map((e) => e.name),
+      });
+      const withMeta = applyPlanRewrite(plan, { ...sanitized, created: todayStr }, {
+        workouts, today: todayStr,
+      });
       setPlan(withMeta);
       persist({ plan: withMeta });
       setOpenDay(todayIdx);
@@ -1848,6 +1927,14 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
     }
     setLive(null); setRestEnd(null);
     persist({ workouts: next, live: null, checkins: nextCi });
+    if (whoop && whoop.strain != null) {
+      const hist = (whoopHist || []).map((h) => ({
+        volume: (workouts.find((x) => x.date === h.date) ? volumeOf(workouts.find((x) => x.date === h.date)) : 0),
+        strain: h.strain,
+      })).filter((h) => h.strain && h.volume);
+      const sb = strainBudget({ volume: volumeOf(w), strain: whoop.strain, history: hist });
+      if (sb && sb.note) setStrainNote(sb.note);
+    }
     setTab("coach");
     if (newPRs.length) setCelebrate(newPRs);
   };
@@ -1894,7 +1981,7 @@ Exactly ${n} entries in "weeks". Include at least one Deload week placed for rec
     setSwapBusy(key); setSwapNote("");
     const gearLabels = profile.gear.length ? profile.gear.map((g) => (GEAR.find(([k]) => k === g) || [g, g])[1]) : ["Bodyweight only"];
     const prompt = `Suggest ONE replacement exercise.
-Athlete: ${profile.level}, goal ${profile.goal}.${(profile.injuries || []).length ? ` Injuries: ${profile.injuries.join("; ")}.` : ""}
+Athlete: ${profile.level}, goal ${profile.goal}.${constraintBlock(profile)}
 Equipment available: ${gearLabels.join(", ")}.
 Session focus: ${dy.focus}. Exercises already in the session: ${dy.exercises.map((e) => e.exercise).join(", ")}.
 Replace "${cur.exercise}" (${cur.sets}×${cur.reps}) with a DIFFERENT movement that hits similar muscles, works with the equipment${(profile.injuries || []).length ? ", is safe for the injuries" : ""}, and is not already in the session.
@@ -2044,35 +2131,38 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
   /* ----- daily auto-adjust to recovery ----- */
   const adjustToday = async (w = whoop) => {
     if (!plan || !plan.week || !w || w.recovery == null) return;
+    if (!canAutoAdjust({ plan, workouts, today: todayStr, todayIdx })) return;
     const dy = plan.week[todayIdx];
-    if (!dy || dy.rest || !dy.exercises || !dy.exercises.length) return;
     setAdjBusy(true);
+    const reason = adjustReason(w);
     const gearLabels = profile.gear.length ? profile.gear.map((g) => (GEAR.find(([k]) => k === g) || [g, g])[1]) : ["Bodyweight only"];
     const prompt = `Adjust today's planned training session to the athlete's recovery. Change only what recovery demands.
 
-Athlete: ${profile.level}, goal ${profile.goal}.${(profile.injuries || []).length ? ` Injuries: ${profile.injuries.join("; ")}.` : ""}
+Athlete: ${profile.level}, goal ${profile.goal}.${constraintBlock(profile)}
 Equipment: ${gearLabels.join(", ")}.
-WHOOP today: recovery ${w.recovery}%, HRV ${w.hrv} ms, RHR ${w.rhr} bpm, sleep ${w.sleepHours}h, yesterday's strain ${w.strain}.
+WHOOP today: ${reason.summary}.
 Planned session: ${JSON.stringify(dy)}${readinessLine ? `
 Per-muscle readiness today: ${readinessLine}.` : ""}
 
 Rules:
-- Recovery under 34% (red): cut loads 20-30%, drop roughly one set per exercise, and swap the most CNS-taxing lifts (heavy squats/deadlifts) for gentler variants.
+- Recovery under 34% (red): cut loads 20-30%, drop roughly one set per exercise${profile.neverSwapCompounds ? "." : ", and swap the most CNS-taxing lifts (heavy squats/deadlifts) for gentler variants."}
 - Recovery 34-66% (yellow): trim loads about 10% and reduce total sets slightly. Keep the session's structure.
 - If a muscle group is listed as fatigued and today's session targets it, prefer swapping that work toward a ready group over simply cutting load.
 - Keep the same day name and a similar exercise count. Use ONLY the available equipment.
+${profile.neverSwapCompounds ? "- Do NOT replace squat/bench/deadlift/press/row — only change load, sets or reps." : ""}
 
 Respond ONLY with valid JSON, no markdown fences:
 {"day":"${dy.day}","rest":false,"focus":"session title","warmup":"one line warm-up for this session","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
     try {
       const clean = await askClaude(prompt, 1200);
       const adj = parseJson(clean);
-      const np = JSON.parse(JSON.stringify(plan));
-      np.originalDay = { idx: todayIdx, day: dy };
-      np.week[todayIdx] = { day: adj.day || dy.day, rest: false, focus: adj.focus || dy.focus, warmup: adj.warmup || dy.warmup, exercises: adj.exercises || dy.exercises };
-      np.adjustedDate = todayStr;
-      np.adjustNote = adj.adjust_note || "Adjusted to today's recovery.";
-      np.adjustRecovery = w.recovery;
+      const sanitized = sanitizePlan({ why: "", tip: "", week: plan.week.map((d, i) => i === todayIdx ? adj : d) }, { profile });
+      const np = applyAutoAdjust(plan, {
+        ...adj,
+        exercises: sanitized.week[todayIdx].exercises,
+        adjustRecovery: w.recovery,
+        adjustReason: reason.summary,
+      }, { today: todayStr, todayIdx, neverSwapCompounds: !!profile.neverSwapCompounds });
       setPlan(np);
       persist({ plan: np });
       setOpenDay(todayIdx);
@@ -2094,10 +2184,8 @@ Respond ONLY with valid JSON, no markdown fences:
   useEffect(() => {
     if (!loaded || !profile || !plan || !whoop || autoAdj.current) return;
     if (whoop.recovery == null || whoop.recovery >= 67) return;      // green: train as planned
-    if (plan.adjustedDate === todayStr) return;                       // already handled today
+    if (!canAutoAdjust({ plan, workouts, today: todayStr, todayIdx })) return;
     if (live || planBusy) return;                                     // never mid-session or mid-build
-    const dy = plan.week && plan.week[todayIdx];
-    if (!dy || dy.rest) return;
     autoAdj.current = true;
     adjustToday(whoop);
     // eslint-disable-next-line
@@ -2542,7 +2630,12 @@ Respond ONLY with valid JSON, no markdown fences:
                   <span key={m} style={{ ...S.chip(false), cursor: "default", fontSize: 12.5, color: T.sub }}>{m}</span>
                 ))}
               </div>
-              <ExPhoto name={modal.name} />
+              <ExPhoto
+                name={modal.name}
+                rejected={!!((profile && profile.photoRejects) || {})[modal.name.trim().toLowerCase()]}
+                onReject={rejectPhoto}
+                fallback={<div style={{ fontSize: 13, color: T.sub, marginBottom: 12 }}>Using the pictogram — photo hidden or missing.</div>}
+              />
               <MuscleHighlightMap info={info} />
               <VideoButton name={modal.name} />
               {info.setup && (
@@ -2695,9 +2788,44 @@ Respond ONLY with valid JSON, no markdown fences:
                 Add
               </button>
             </div>
-            <p style={{ color: T.sub, fontSize: 12.5, margin: 0 }}>
+            <p style={{ color: T.sub, fontSize: 12.5, margin: "0 0 14px" }}>
               The coach programs around these — plans and exercise swaps will avoid aggravating movements.
             </p>
+            <span style={S.label}>Never program these lifts</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+              {(d.avoid || []).map((x) => (
+                <span key={x} style={{ ...S.chip(true), cursor: "default" }}>
+                  {x} <span onClick={() => setDF("avoid", d.avoid.filter((y) => y !== x))} style={{ cursor: "pointer" }}>✕</span>
+                </span>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <input style={{ ...S.input, flex: 1 }} value={addAvoid} placeholder="e.g. behind-the-neck press"
+                onChange={(e) => setAddAvoid(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && addAvoid.trim()) { setDF("avoid", [...(d.avoid || []), addAvoid.trim()]); setAddAvoid(""); } }} />
+              <button style={S.ghost} onClick={() => { if (addAvoid.trim()) { setDF("avoid", [...(d.avoid || []), addAvoid.trim()]); setAddAvoid(""); } }}>Add</button>
+            </div>
+            <span style={S.label}>Prefer these when swapping</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+              {(d.prefer || []).map((x) => (
+                <span key={x} style={{ ...S.chip(true), cursor: "default" }}>
+                  {x} <span onClick={() => setDF("prefer", d.prefer.filter((y) => y !== x))} style={{ cursor: "pointer" }}>✕</span>
+                </span>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <input style={{ ...S.input, flex: 1 }} value={addPrefer} placeholder="e.g. goblet squat"
+                onChange={(e) => setAddPrefer(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && addPrefer.trim()) { setDF("prefer", [...(d.prefer || []), addPrefer.trim()]); setAddPrefer(""); } }} />
+              <button style={S.ghost} onClick={() => { if (addPrefer.trim()) { setDF("prefer", [...(d.prefer || []), addPrefer.trim()]); setAddPrefer(""); } }}>Add</button>
+            </div>
+            <span style={S.label}>Standing notes for the coach</span>
+            <textarea rows={2} style={{ ...S.input, resize: "vertical", marginBottom: 12 }}
+              placeholder="Shoulder cranky on wide grip. Keep compounds."
+              value={d.constraintNotes || ""} onChange={(e) => setDF("constraintNotes", e.target.value)} />
+            <button style={S.chip(!!d.neverSwapCompounds)} onClick={() => setDF("neverSwapCompounds", !d.neverSwapCompounds)}>
+              Never auto-swap compounds
+            </button>
           </div>
 
           {profile && (
@@ -2841,6 +2969,34 @@ Respond ONLY with valid JSON, no markdown fences:
               <p style={{ color: T.sub, fontSize: 12.5, margin: 0 }}>
                 JSON is a full backup of everything. CSV is your workout log for spreadsheets.
               </p>
+              {health && health.warning && (
+                <p style={{ color: T.red, fontSize: 12.5, margin: "10px 0 0" }}>{health.warning}</p>
+              )}
+            </div>
+          )}
+          {profile && (
+            <div style={S.card}>
+              <Rule label="Password" />
+              <span style={S.label}>Current</span>
+              <input type="password" style={{ ...S.input, marginBottom: 8 }} value={pwCur} onChange={(e) => setPwCur(e.target.value)} />
+              <span style={S.label}>New password</span>
+              <input type="password" style={{ ...S.input, marginBottom: 10 }} value={pwNext} onChange={(e) => setPwNext(e.target.value)} />
+              <button style={S.ghost} onClick={async () => {
+                setPwNote("");
+                try {
+                  const r = await fetch("/api/auth/password", {
+                    method: "POST", headers: apiHeaders(),
+                    body: JSON.stringify({ current: pwCur, next: pwNext }),
+                  });
+                  const j = await r.json();
+                  if (!r.ok) { setPwNote(j.error || "Could not change password"); return; }
+                  try { localStorage.setItem("forge-token", pwNext); } catch (e) {}
+                  APP_TOKEN = pwNext;
+                  setPwNote("Password updated. You'll need it next time you unlock.");
+                  setPwCur(""); setPwNext("");
+                } catch (e) { setPwNote("Network error"); }
+              }}>Change password</button>
+              {pwNote && <div style={{ fontSize: 12.5, color: T.sub, marginTop: 8 }}>{pwNote}</div>}
             </div>
           )}
           <button style={S.btn} onClick={saveProfile}>{profile ? "Save & rebuild my plan" : "Build my weekly plan →"}</button>
@@ -2871,6 +3027,19 @@ Respond ONLY with valid JSON, no markdown fences:
         {/* ================= PLAN ================= */}
         {tab === "coach" && (
           <>
+            {health && health.warning && (
+              <div style={{ ...S.card, background: T.redDim, borderLeft: `2px solid ${T.red}` }}>
+                <b style={{ color: T.red }}>Storage · </b>
+                <span style={{ fontSize: 13.5 }}>{health.warning}</span>
+              </div>
+            )}
+            {strainNote && (
+              <div style={{ ...S.card, background: T.blueDim, borderLeft: `2px solid ${T.blue}` }}>
+                <b style={{ color: T.blue }}>Strain vs volume · </b>
+                <span style={{ fontSize: 13.5 }}>{strainNote}</span>
+              </div>
+            )}
+            {undoNote && <div style={{ ...S.card, fontSize: 13 }}>{undoNote}</div>}
             {live && (
               <div onClick={() => setTab("live")} style={{
                 ...S.card, borderColor: T.gold, cursor: "pointer",
@@ -2924,7 +3093,8 @@ Respond ONLY with valid JSON, no markdown fences:
                   {whoop.recovery}%
                 </div>
                 <div style={{ flex: 1, fontSize: 12.5, color: T.sub, lineHeight: 1.5 }}>
-                  <b style={{ color: T.text }}>WHOOP recovery</b> — coach adjusts today's intensity to this.<br />
+                  <b style={{ color: T.text }}>WHOOP recovery</b> — a signal, not the session.
+                  {whoop && adjustReason(whoop).summary && <><br />{adjustReason(whoop).summary}</>}<br />
                   {whoop.hrv != null && <>HRV {whoop.hrv}ms · </>}
                   {whoop.rhr != null && <>RHR {whoop.rhr} · </>}
                   {whoop.sleepHours != null && <>Sleep {whoop.sleepHours}h · </>}
@@ -2944,8 +3114,9 @@ Respond ONLY with valid JSON, no markdown fences:
             {!adjBusy && plan && plan.adjustedDate === todayStr && plan.adjustNote && !plan.adjustUndone && (
               <div style={{ ...S.card, background: T.goldDim, borderColor: T.line, borderLeft: `2px solid ${T.gold}` }}>
                 <div style={{ fontSize: 13.5, lineHeight: 1.5 }}>
-                  <b style={{ color: T.gold }}>⚡ Today auto-adjusted for {plan.adjustRecovery}% recovery · </b>
+                  <b style={{ color: T.gold }}>⚡ Today auto-adjusted{plan.adjustRecovery != null ? ` for ${plan.adjustRecovery}% recovery` : ""} · </b>
                   {plan.adjustNote}
+                  {plan.adjustReason && <div style={{ color: T.sub, marginTop: 4 }}>{plan.adjustReason}</div>}
                 </div>
                 {plan.originalDay && (
                   <button onClick={undoAdjust} style={{
@@ -3189,6 +3360,7 @@ Respond ONLY with valid JSON, no markdown fences:
                   </div>
                 )}
                 <button style={{ ...S.ghost, width: "100%" }} onClick={() => getPlan()}>Rebuild this week's plan</button>
+                <button style={{ ...S.ghost, width: "100%", marginTop: 8 }} onClick={undoLastMutation}>Undo last plan change</button>
                 <div style={{ fontSize: 12, color: T.sub, marginTop: 8, textAlign: "center" }}>
                   Tap any exercise for form, muscles worked, and do's & don'ts.
                 </div>
@@ -3393,6 +3565,13 @@ Respond ONLY with valid JSON, no markdown fences:
                     <input inputMode="decimal" placeholder="kg" value={s.weight} disabled={s.done}
                       onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[si].weight = e.target.value; })}
                       style={{ ...S.inputNum, width: 74, flex: "none", padding: "10px 8px" }} />
+                    {!s.done && (
+                      <button type="button" onClick={() => updLive((nl) => {
+                        const cur = nl.exercises[nl.idx].sets[si];
+                        cur.weight = String(bumpWeight(cur.weight || 0, 2.5));
+                      })}
+                        style={{ ...S.ghost, padding: "8px 8px", flex: "none" }}>+2.5</button>
+                    )}
                     <input inputMode="numeric" placeholder="reps" value={s.reps} disabled={s.done}
                       onChange={(e) => updLive((nl) => { nl.exercises[nl.idx].sets[si].reps = e.target.value; })}
                       style={{ ...S.inputNum, width: 64, flex: "none", padding: "10px 8px" }} />
@@ -3429,6 +3608,15 @@ Respond ONLY with valid JSON, no markdown fences:
               </div>
 
               <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <button style={{ ...S.ghost, flex: 1 }}
+                  onClick={() => {
+                    if (window.confirm("Skip this lift?")) {
+                      updLive((nl) => {
+                        if (nl.idx < nl.exercises.length - 1) nl.idx++;
+                      }, true);
+                      setRestEnd(null);
+                    }
+                  }}>Skip</button>
                 <button style={{ ...S.ghost, flex: 1, opacity: live.idx === 0 ? 0.4 : 1 }} disabled={live.idx === 0}
                   onClick={() => { updLive((nl) => { nl.idx--; }, true); setRestEnd(null); }}>
                   ← Prev
