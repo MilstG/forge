@@ -267,13 +267,28 @@ async function fetchWhoopSummary() {
     return r.ok ? r.json() : null;
   };
   const [rec, slp, cyc] = await Promise.all([
-    j("/recovery?limit=1"),
-    j("/activity/sleep?limit=1"),
-    j("/cycle?limit=1"),
+    j("/recovery?limit=3"),
+    j("/activity/sleep?limit=3"),
+    j("/cycle?limit=3"),
   ]);
-  const recRec = rec && rec.records && rec.records[0];
+  const today = dateInTz();
+  const cycles = (cyc && cyc.records) || [];
+  // WHOOP returns newest first. The open cycle (no `end`) is *today*; the newest
+  // closed cycle is *yesterday* — its strain is what today's recovery responds to.
+  const openCycle = cycles.find((c) => !c.end) || cycles[0] || null;
+  const closedCycle = cycles.find((c) => c.end && (!openCycle || c.id !== openCycle.id)) || null;
+
+  // Recovery belongs to the open cycle. If WHOOP hasn't scored it yet, fall back
+  // to the newest scored one but flag it as stale so the UI doesn't pretend.
+  const recs = (rec && rec.records) || [];
+  const scored = (r) => r && r.score && r.score.recovery_score != null && r.score_state !== "PENDING_SCORE";
+  let recRec = openCycle ? recs.find((r) => r.cycle_id === openCycle.id && scored(r)) : null;
+  if (!recRec) recRec = recs.find(scored) || recs[0] || null;
   const rs = (recRec && recRec.score) || {};
-  const sleepRec = slp && slp.records && slp.records[0];
+
+  // Sleep: the one that feeds this recovery (same cycle), else the newest.
+  const slps = (slp && slp.records) || [];
+  const sleepRec = (recRec && slps.find((x) => x.id === recRec.sleep_id)) || slps.find((x) => !x.nap) || slps[0] || null;
   const ss = (sleepRec && sleepRec.score) || {};
   let sleepHours = null;
   if (ss.stage_summary) {
@@ -285,22 +300,28 @@ async function fetchWhoopSummary() {
   if (sleepHours === null && sleepRec && sleepRec.start && sleepRec.end) {
     sleepHours = Math.round((new Date(sleepRec.end) - new Date(sleepRec.start)) / 360000) / 10;
   }
-  const cs = (cyc && cyc.records && cyc.records[0] && cyc.records[0].score) || {};
+  const ycs = (closedCycle && closedCycle.score) || {};
+  const tcs = (openCycle && openCycle.score) || {};
+  const recoveryCreatedAt = (recRec && (recRec.created_at || recRec.updated_at)) || null;
+  const recoveryDate = recoveryCreatedAt ? dateInTz(new Date(recoveryCreatedAt)) : null;
   const data = {
     recovery: rs.recovery_score ?? null,
     hrv: rs.hrv_rmssd_milli != null ? Math.round(rs.hrv_rmssd_milli) : null,
     rhr: rs.resting_heart_rate ?? null,
     sleepHours,
     sleepPerf: ss.sleep_performance_percentage != null ? Math.round(ss.sleep_performance_percentage) : null,
-    strain: cs.strain != null ? Math.round(cs.strain * 10) / 10 : null,
-    recoveryCreatedAt: (recRec && (recRec.created_at || recRec.updated_at)) || null,
+    strain: ycs.strain != null ? Math.round(ycs.strain * 10) / 10 : null,        // yesterday's (closed cycle)
+    todayStrain: tcs.strain != null ? Math.round(tcs.strain * 10) / 10 : null,   // so far today (open cycle)
+    recoveryCreatedAt,
+    recoveryDate,
+    stale: !!recoveryDate && recoveryDate !== today,                             // today's not scored yet
     updated: new Date().toISOString(),
   };
   whoopCache = { at: Date.now(), data };
 
   // Persist a daily snapshot — correlations need history, not just today.
   try {
-    const day = data.recoveryCreatedAt ? dateInTz(new Date(data.recoveryCreatedAt)) : dateInTz();
+    const day = data.recoveryDate || dateInTz();
     if (data.recovery != null) {
       const hist = readJson("whoop-history.json", []);
       const rest = hist.filter((h) => h.date !== day);
@@ -317,7 +338,10 @@ async function fetchWhoopSummary() {
 }
 
 app.get("/api/whoop/summary", async (_req, res) => {
-  if (whoopCache.data && Date.now() - whoopCache.at < 15 * 60 * 1000) return res.json(whoopCache.data);
+  // Fresh for 15 min normally — but only 2 min while we're still holding
+  // yesterday's recovery, so today's shows up shortly after WHOOP scores it.
+  const ttl = whoopCache.data && whoopCache.data.stale ? 2 * 60 * 1000 : 15 * 60 * 1000;
+  if (whoopCache.data && Date.now() - whoopCache.at < ttl) return res.json(whoopCache.data);
   try {
     const data = await fetchWhoopSummary();
     if (!data) return res.status(400).json({ error: "not connected" });
@@ -558,7 +582,7 @@ app.get("/api/ai/diag", async (req, res) => {
 });
 
 /* ---- background auto-adjust ----
-   Every 30 minutes: once WHOOP has synced today's recovery, adjust
+   Every 15 minutes: once WHOOP has synced today's recovery, adjust
    today's planned session in forge.json — no app open required.
    Set TIMEZONE (IANA name, e.g. America/Argentina/Buenos_Aires) so
    "today" matches your day, and AUTO_ADJUST=off to disable. */
@@ -588,8 +612,7 @@ async function autoAdjustCheck() {
 
     const sum = await fetchWhoopSummary();
     if (!sum || sum.recovery == null) return;                      // WHOOP not connected / no data
-    const recDay = sum.recoveryCreatedAt ? dateInTz(new Date(sum.recoveryCreatedAt)) : today;
-    if (recDay !== today) return;                                  // hasn't synced today yet — retry next tick
+    if (sum.stale || (sum.recoveryDate && sum.recoveryDate !== today)) return;                                  // hasn't synced today yet — retry next tick
 
     if (sum.recovery >= 67) {                                      // green: train as planned
       data.plan.adjustedDate = today;
@@ -634,8 +657,20 @@ Respond ONLY with valid JSON, no markdown fences:
     console.error("[auto-adjust] failed:", String(e.message || e));
   }
 }
-setInterval(autoAdjustCheck, 30 * 60 * 1000);
-setTimeout(autoAdjustCheck, 20 * 1000); // and shortly after boot
+/* Every 15 min: pull WHOOP so the history file and cache stay current even
+   when the app is closed. Goes through the cache, so it's a real WHOOP call
+   only when the cached copy has expired. Then run the auto-adjust check. */
+async function whoopPoll() {
+  try {
+    const t = readJson("whoop.json", null);
+    if (!t || !t.access_token) return;
+    const ttl = whoopCache.data && whoopCache.data.stale ? 2 * 60 * 1000 : 15 * 60 * 1000;
+    if (!whoopCache.data || Date.now() - whoopCache.at >= ttl) await fetchWhoopSummary();
+  } catch (e) { console.error("[whoop] poll failed:", String(e.message || e)); }
+  await autoAdjustCheck();
+}
+setInterval(whoopPoll, 15 * 60 * 1000);
+setTimeout(whoopPoll, 20 * 1000); // and shortly after boot
 
 /* ================= push notifications =================
    Web Push works on iOS 16.4+ but only once the app is installed to the
