@@ -977,20 +977,36 @@ export default function Forge() {
         const hz = await fetch("/api/health");
         if (hz.ok) setHealth(await hz.json());
       } catch (e) {}
-      try {
-        const s = await fetch("/api/whoop/status", { headers: apiHeaders() });
-        if (s.ok) {
-          const st = await s.json();
-          setWhoopConn(!!st.connected);
-          if (st.connected) {
-            const r = await fetch("/api/whoop/summary", { headers: apiHeaders() });
-            if (r.ok) setWhoop(await r.json());
-            const h = await fetch("/api/whoop/history", { headers: apiHeaders() });
-            if (h.ok) setWhoopHist(await h.json());
-          }
-        }
-      } catch (e) {}
+      refreshWhoop();
     })();
+  }, []);
+
+  /* WHOOP: re-fetch whenever the app comes back to the foreground and every
+     15 min while visible. A PWA left open overnight otherwise keeps showing
+     yesterday's recovery — the first fetch was the only one. */
+  const refreshWhoop = async () => {
+    try {
+      const s = await fetch("/api/whoop/status", { headers: apiHeaders() });
+      if (!s.ok) return;
+      const st = await s.json();
+      setWhoopConn(!!st.connected);
+      if (!st.connected) return;
+      const r = await fetch("/api/whoop/summary", { headers: apiHeaders() });
+      if (r.ok) setWhoop(await r.json());
+      const h = await fetch("/api/whoop/history", { headers: apiHeaders() });
+      if (h.ok) setWhoopHist(await h.json());
+    } catch (e) {}
+  };
+  useEffect(() => {
+    const onVis = () => { if (document.visibilityState === "visible") refreshWhoop(); };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onVis);
+    const id = setInterval(() => { if (document.visibilityState === "visible") refreshWhoop(); }, 15 * 60 * 1000);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onVis);
+      clearInterval(id);
+    };
   }, []);
 
   const unlock = async () => {
@@ -1771,7 +1787,7 @@ Athlete:
 - Age ${p.age || "?"}, sex ${p.sex}, height ${p.height || "?"} cm, weight ${p.weight || "?"} kg
 - Experience: ${p.level}. Wants to train ${p.days} days/week.
 - Main goal: ${p.goal}. Specific goals in their own words: "${p.specific || "none given"}"
-- Available equipment: ${gearLabels.join(", ")}${constraintBlock(p)}${whoop && whoop.recovery != null ? `
+- Available equipment: ${gearLabels.join(", ")}${constraintBlock(p)}${whoop && whoop.recovery != null && !whoop.stale ? `
 - Today's WHOOP: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr} bpm, sleep ${whoop.sleepHours}h${whoop.sleepPerf ? ` (${whoop.sleepPerf}% performance)` : ""}, yesterday's strain ${whoop.strain}. Calibrate intensity to recovery: under 34% go much lighter, 34-66% moderate, above 66% full intensity.` : ""}${bc.ctx}
 - Recent workouts (most recent first, rpe is 1-10 perceived effort where given): ${JSON.stringify(recent)}${avgRpe ? `
 - Average logged RPE: ${avgRpe}. If recent RPE at given loads is 9+, hold or reduce load rather than adding weight; if 6 or below, add a larger jump.` : ""}${todayCheckin && (todayCheckin.soreness || []).length ? `
@@ -1927,12 +1943,13 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
     }
     setLive(null); setRestEnd(null);
     persist({ workouts: next, live: null, checkins: nextCi });
-    if (whoop && whoop.strain != null) {
+    const sessionStrain = whoop ? (whoop.todayStrain ?? whoop.strain) : null;
+    if (sessionStrain != null) {
       const hist = (whoopHist || []).map((h) => ({
         volume: (workouts.find((x) => x.date === h.date) ? volumeOf(workouts.find((x) => x.date === h.date)) : 0),
         strain: h.strain,
       })).filter((h) => h.strain && h.volume);
-      const sb = strainBudget({ volume: volumeOf(w), strain: whoop.strain, history: hist });
+      const sb = strainBudget({ volume: volumeOf(w), strain: sessionStrain, history: hist });
       if (sb && sb.note) setStrainNote(sb.note);
     }
     setTab("coach");
@@ -2183,7 +2200,7 @@ Respond ONLY with valid JSON, no markdown fences:
 
   useEffect(() => {
     if (!loaded || !profile || !plan || !whoop || autoAdj.current) return;
-    if (whoop.recovery == null || whoop.recovery >= 67) return;      // green: train as planned
+    if (whoop.stale || whoop.recovery == null || whoop.recovery >= 67) return; // stale or green: leave the session alone
     if (!canAutoAdjust({ plan, workouts, today: todayStr, todayIdx })) return;
     if (live || planBusy) return;                                     // never mid-session or mid-build
     autoAdj.current = true;
@@ -2239,7 +2256,7 @@ ${cardio28.n ? `Cardio and timed work is logged in minutes, not sets — it carr
 ` : ""}PRs: ${JSON.stringify(prList.slice(0, 6))}
 Body weight log: ${JSON.stringify(bwSorted.slice(-6))}
 ${(profile.injuries || []).length ? `Injuries/limitations: ${profile.injuries.join("; ")}
-` : ""}${whoop && whoop.recovery != null ? `WHOOP today: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr}, sleep ${whoop.sleepHours}h, strain ${whoop.strain}
+` : ""}${whoop && whoop.recovery != null && !whoop.stale ? `WHOOP today: recovery ${whoop.recovery}%, HRV ${whoop.hrv} ms, RHR ${whoop.rhr}, sleep ${whoop.sleepHours}h, strain ${whoop.strain}
 ` : ""}${nutAvg && nut ? `Nutrition last 7 days (${nutAvg.n} logged): avg ${nutAvg.k} kcal vs ${nut.kcal} target, ${nutAvg.p}g protein vs ${nut.protein}g target
 ` : ""}${block && blockPhase ? `Training block "${block.name}": week ${blockWeek}/${block.weeks.length}, phase ${blockPhase.type}
 ` : ""}${avgRpe ? `Average RPE ${avgRpe} across ${rpeEntries.length} rated sets.
@@ -3094,11 +3111,8 @@ Respond ONLY with valid JSON, no markdown fences:
                 </div>
                 <div style={{ flex: 1, fontSize: 12.5, color: T.sub, lineHeight: 1.5 }}>
                   <b style={{ color: T.text }}>WHOOP recovery</b> — a signal, not the session.
-                  {whoop && adjustReason(whoop).summary && <><br />{adjustReason(whoop).summary}</>}<br />
-                  {whoop.hrv != null && <>HRV {whoop.hrv}ms · </>}
-                  {whoop.rhr != null && <>RHR {whoop.rhr} · </>}
-                  {whoop.sleepHours != null && <>Sleep {whoop.sleepHours}h · </>}
-                  {whoop.strain != null && <>Strain {whoop.strain}</>}
+                  {whoop.stale && <><br /><span style={{ color: T.gold }}>Yesterday's score — today's isn't in yet.</span></>}
+                  {whoop && adjustReason(whoop).summary && <><br />{adjustReason(whoop).summary}</>}
                 </div>
               </div>
             )}
