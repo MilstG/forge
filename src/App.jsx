@@ -831,6 +831,9 @@ const isStandalone = () =>
 const pushSupported = () =>
   "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 
+/* The app registers a listener here so every AI response can update the
+   on-screen daily-quota pips without threading state through call sites. */
+let onAiQuota = null;
 async function askClaude(prompt, maxTokens = 1500) {
   const res = await fetch("/api/claude", {
     method: "POST",
@@ -839,6 +842,7 @@ async function askClaude(prompt, maxTokens = 1500) {
   });
   let data = null;
   try { data = await res.json(); } catch (e) {}
+  if (data && data.ai && onAiQuota) onAiQuota(data.ai);
   if (!res.ok) {
     throw new Error((data && data.error) || `Request failed (${res.status}).`);
   }
@@ -898,6 +902,14 @@ export default function Forge() {
   const [authNeeded, setAuthNeeded] = useState(false);
   const [pw, setPw] = useState("");
   const [pwErr, setPwErr] = useState("");
+  const [me, setMe] = useState(null);
+  const [aiQuota, setAiQuota] = useState(null);
+  const [loginUsers, setLoginUsers] = useState(null);
+  const [selUser, setSelUser] = useState(null);
+  const [adminUsers, setAdminUsers] = useState(null);
+  const [nuName, setNuName] = useState("");
+  const [nuPw, setNuPw] = useState("");
+  const [nuNote, setNuNote] = useState("");
 
   const [d, setD] = useState({
     age: "", sex: "M", height: "", weight: "",
@@ -977,9 +989,45 @@ export default function Forge() {
         const hz = await fetch("/api/health");
         if (hz.ok) setHealth(await hz.json());
       } catch (e) {}
+      try {
+        const mr = await fetch("/api/auth/me", { headers: apiHeaders() });
+        if (mr.ok) {
+          const m = await mr.json();
+          setMe(m);
+          if (m.ai && m.ai.limit != null) setAiQuota(m.ai);
+        }
+      } catch (e) {}
       refreshWhoop();
     })();
   }, []);
+  useEffect(() => {
+    onAiQuota = (ai) => setAiQuota(ai);
+    return () => { onAiQuota = null; };
+  }, []);
+  /* admin: load the users panel when settings open */
+  useEffect(() => {
+    if (!me || !me.admin || tab !== "profile" || adminUsers) return;
+    (async () => {
+      try {
+        const r = await fetch("/api/users", { headers: apiHeaders() });
+        if (r.ok) setAdminUsers(await r.json());
+      } catch (e) {}
+    })();
+  }, [me, tab, adminUsers]);
+  /* the login screen needs the user list before any auth exists */
+  useEffect(() => {
+    if (!authNeeded || loginUsers) return;
+    (async () => {
+      try {
+        const r = await fetch("/api/auth/users");
+        if (r.ok) {
+          const list = await r.json();
+          setLoginUsers(list);
+          if (list.length === 1) setSelUser(list[0].id);
+        } else setLoginUsers([]);
+      } catch (e) { setLoginUsers([]); }
+    })();
+  }, [authNeeded, loginUsers]);
 
   /* WHOOP: re-fetch whenever the app comes back to the foreground and every
      15 min while visible. A PWA left open overnight otherwise keeps showing
@@ -1011,20 +1059,18 @@ export default function Forge() {
 
   const unlock = async () => {
     const val = pw.trim();
-    if (!val) return;
+    if (!selUser) { setPwErr("Pick who you are first."); return; }
     setPwErr("");
     try {
-      await fetch("/api/auth/login", {
+      const lr = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: val }),
+        body: JSON.stringify({ userId: selUser, password: val }),
       });
-      const r = await fetch("/api/data", {
-        headers: { "Content-Type": "application/json", "x-app-token": encodeURIComponent(val) },
-      });
-      if (r.status === 401) { setPwErr("That password doesn't match. Check the APP_PASSWORD variable in Railway."); return; }
-      if (!r.ok) { setPwErr("Server error — try again in a moment."); return; }
-      try { localStorage.setItem("forge-token", val); } catch (e) {
+      if (lr.status === 401) { setPwErr("That password doesn't match this account."); return; }
+      if (!lr.ok) { setPwErr("Server error — try again in a moment."); return; }
+      const combined = selUser + ":" + val;
+      try { localStorage.setItem("forge-token", combined); } catch (e) {
         /* cookie session still works even if storage is blocked */
       }
       window.location.reload();
@@ -2701,9 +2747,34 @@ Respond ONLY with valid JSON, no markdown fences:
         <div style={{ ...S.scroll, display: "flex", alignItems: "center", justifyContent: "center" }}>
           <div style={{ ...S.card, width: 300 }}>
             <div style={{ ...display, fontSize: 30, marginBottom: 6, letterSpacing: "0.06em" }}>Forge<span style={{ color: T.accent }}>.</span></div>
-            <p style={{ color: T.sub, fontSize: 13, marginTop: 0 }}>This app is password-protected.</p>
+            <p style={{ color: T.sub, fontSize: 13, marginTop: 0 }}>Who's training?</p>
+            {loginUsers === null && <p style={{ color: T.dim, fontSize: 13 }}>Loading…</p>}
+            {loginUsers && loginUsers.length === 0 && (
+              <p style={{ color: T.sub, fontSize: 12.5 }}>No accounts found — the server may still be starting. Reload in a moment.</p>
+            )}
+            {loginUsers && loginUsers.length > 0 && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
+                {loginUsers.map((u) => (
+                  <button key={u.id} onClick={() => { setSelUser(u.id); setPwErr(""); }}
+                    style={{
+                      ...S.ghost, padding: "12px 6px", display: "flex", flexDirection: "column",
+                      alignItems: "center", gap: 6,
+                      border: `1.5px solid ${selUser === u.id ? T.accent : T.line}`,
+                      background: selUser === u.id ? T.accentDim || "transparent" : "transparent",
+                    }}>
+                    <span style={{
+                      width: 36, height: 36, borderRadius: "50%", display: "flex", alignItems: "center",
+                      justifyContent: "center", fontWeight: 800, fontSize: 15,
+                      background: selUser === u.id ? T.accent : T.line, color: selUser === u.id ? "#fff" : T.sub,
+                    }}>{(u.name || "?").slice(0, 1).toUpperCase()}</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: T.text }}>{u.name}</span>
+                    {u.admin && <span style={{ fontSize: 10.5, color: T.dim }}>admin</span>}
+                  </button>
+                ))}
+              </div>
+            )}
             <span style={S.label}>Password</span>
-            <input type="password" autoFocus value={pw}
+            <input type="password" value={pw}
               onChange={(e) => setPw(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && unlock()}
               style={{ ...S.input, marginBottom: 12 }} />
@@ -3007,13 +3078,95 @@ Respond ONLY with valid JSON, no markdown fences:
                   });
                   const j = await r.json();
                   if (!r.ok) { setPwNote(j.error || "Could not change password"); return; }
-                  try { localStorage.setItem("forge-token", pwNext); } catch (e) {}
-                  APP_TOKEN = pwNext;
+                  const combined = (me ? me.id : "") + ":" + pwNext;
+                  try { localStorage.setItem("forge-token", combined); } catch (e) {}
+                  APP_TOKEN = combined;
                   setPwNote("Password updated. You'll need it next time you unlock.");
                   setPwCur(""); setPwNext("");
                 } catch (e) { setPwNote("Network error"); }
               }}>Change password</button>
               {pwNote && <div style={{ fontSize: 12.5, color: T.sub, marginTop: 8 }}>{pwNote}</div>}
+              <button style={{ ...S.ghost, marginTop: 10 }} onClick={async () => {
+                try { await fetch("/api/auth/logout", { method: "POST", headers: apiHeaders() }); } catch (e) {}
+                try { localStorage.removeItem("forge-token"); } catch (e) {}
+                window.location.reload();
+              }}>Switch user</button>
+            </div>
+          )}
+          {profile && me && me.admin && (
+            <div style={S.card}>
+              <Rule label="Users" right={adminUsers ? `${adminUsers.length} of 6` : null} />
+              {!adminUsers && <p style={{ color: T.dim, fontSize: 12.5, margin: 0 }}>Loading…</p>}
+              {adminUsers && adminUsers.map((u) => (
+                <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 0", borderBottom: `1px solid ${T.line}` }}>
+                  <span style={{
+                    width: 30, height: 30, borderRadius: "50%", display: "flex", alignItems: "center",
+                    justifyContent: "center", fontWeight: 800, fontSize: 13, flexShrink: 0,
+                    background: u.admin ? T.accentDim : T.line, color: u.admin ? T.accent : T.sub,
+                  }}>{(u.name || "?").slice(0, 1).toUpperCase()}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 700 }}>{u.name}{u.admin ? " · admin" : ""}</div>
+                    <div style={{ fontSize: 11.5, color: T.dim }}>
+                      {u.admin ? "No AI cap" : `AI today: ${u.aiToday} of ${u.aiLimit}`}
+                      {u.whoop ? " · WHOOP" : ""}
+                      {!u.lastLogin ? " · never logged in" : ""}
+                    </div>
+                  </div>
+                  {!u.admin && (
+                    <>
+                      <button style={{ ...S.ghost, padding: "5px 9px", fontSize: 12 }} onClick={async () => {
+                        const np = window.prompt(`New temporary password for ${u.name} (min 4 chars):`);
+                        if (!np) return;
+                        try {
+                          const r = await fetch(`/api/users/${u.id}/password`, {
+                            method: "POST", headers: apiHeaders(), body: JSON.stringify({ password: np }),
+                          });
+                          const j = await r.json();
+                          setNuNote(r.ok ? `${u.name}'s password was reset.` : (j.error || "Reset failed"));
+                        } catch (e) { setNuNote("Network error"); }
+                      }}>Reset pw</button>
+                      <button style={{ ...S.ghost, padding: "5px 9px", fontSize: 12, color: T.red }} onClick={async () => {
+                        if (!window.confirm(`Remove ${u.name}? Their login stops working. Their data is parked on the server, not deleted.`)) return;
+                        try {
+                          const r = await fetch(`/api/users/${u.id}`, { method: "DELETE", headers: apiHeaders() });
+                          if (r.ok) setAdminUsers(adminUsers.filter((x) => x.id !== u.id));
+                          else { const j = await r.json(); setNuNote(j.error || "Remove failed"); }
+                        } catch (e) { setNuNote("Network error"); }
+                      }}>Remove</button>
+                    </>
+                  )}
+                </div>
+              ))}
+              {adminUsers && adminUsers.length < 6 && (
+                <div style={{ marginTop: 12 }}>
+                  <span style={S.label}>Add a user</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input placeholder="Name" value={nuName} onChange={(e) => setNuName(e.target.value)}
+                      style={{ ...S.input, marginBottom: 0, flex: 1 }} />
+                    <input placeholder="Temp password" value={nuPw} onChange={(e) => setNuPw(e.target.value)}
+                      style={{ ...S.input, marginBottom: 0, flex: 1 }} />
+                  </div>
+                  <button style={{ ...S.ghost, marginTop: 8 }} onClick={async () => {
+                    setNuNote("");
+                    try {
+                      const r = await fetch("/api/users", {
+                        method: "POST", headers: apiHeaders(),
+                        body: JSON.stringify({ name: nuName.trim(), password: nuPw.trim() }),
+                      });
+                      const j = await r.json();
+                      if (!r.ok) { setNuNote(j.error || "Could not add user"); return; }
+                      setNuName(""); setNuPw("");
+                      setNuNote(`${j.user.name} was added. Give them the temp password — they can change it in their own Settings.`);
+                      const lr = await fetch("/api/users", { headers: apiHeaders() });
+                      if (lr.ok) setAdminUsers(await lr.json());
+                    } catch (e) { setNuNote("Network error"); }
+                  }}>Add user</button>
+                </div>
+              )}
+              {nuNote && <div style={{ fontSize: 12.5, color: T.sub, marginTop: 8 }}>{nuNote}</div>}
+              <p style={{ color: T.dim, fontSize: 11.5, margin: "10px 0 0" }}>
+                Everyone gets their own plans, logs, WHOOP connection and reminders. Non-admin accounts have a 3-call daily AI budget.
+              </p>
             </div>
           )}
           <button style={S.btn} onClick={saveProfile}>{profile ? "Save & rebuild my plan" : "Build my weekly plan →"}</button>
@@ -3044,6 +3197,20 @@ Respond ONLY with valid JSON, no markdown fences:
         {/* ================= PLAN ================= */}
         {tab === "coach" && (
           <>
+            {me && !me.admin && aiQuota && aiQuota.limit != null && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "2px 2px 10px" }}>
+                <span style={{ fontSize: 11.5, color: T.dim }}>AI today</span>
+                {Array.from({ length: aiQuota.limit }).map((_, i) => (
+                  <span key={i} style={{
+                    width: 16, height: 5, borderRadius: 3,
+                    background: i < aiQuota.used ? T.accent : T.line,
+                  }} />
+                ))}
+                <span style={{ fontSize: 11.5, color: aiQuota.left === 0 ? T.red : T.dim }}>
+                  {aiQuota.left === 0 ? "limit reached · resets at midnight" : `${aiQuota.left} left`}
+                </span>
+              </div>
+            )}
             {health && health.warning && (
               <div style={{ ...S.card, background: T.redDim, borderLeft: `2px solid ${T.red}` }}>
                 <b style={{ color: T.red }}>Storage · </b>
