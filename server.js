@@ -39,14 +39,79 @@ const writeJson = (f, data) => {
   fs.renameSync(tmp, fileFor(f)); // atomic-ish write
 };
 
-/* ---- auth: env password, optional override in auth.json, session cookie ----
-   x-app-token still works. After login the browser holds an httpOnly cookie
-   so the password is not resent on every request. Change-password writes
-   auth.json and does not require a redeploy. */
-const ENV_PASSWORD = (process.env.APP_PASSWORD || "").trim();
-const authFile = () => readJson("auth.json", { sessions: [] });
-const currentPassword = () => (authFile().password || ENV_PASSWORD).trim();
-const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth", "/auth/login", "/health"]);
+/* ---- users: multi-user accounts on the volume ----
+   users.json: { users: [{id,name,hash,salt,admin,...}], sessions: [{token,userId,exp,at}] }
+   The first boot after this upgrade migrates the single-user install:
+   the existing password becomes the admin account and every per-user data
+   file moves into users/<id>/. Shared files (vapid.json, exinfo.json,
+   users.json) stay at the volume root. */
+const MAX_USERS = 6;
+const AI_DAILY_LIMIT = 3;
+const hashPassword = (pw, salt) => crypto.scryptSync(String(pw), salt, 32).toString("hex");
+const newUserId = () => crypto.randomBytes(6).toString("hex");
+const usersFile = () => readJson("users.json", { users: [], sessions: [] });
+const saveUsers = (store) => writeJson("users.json", store);
+const userDir = (id) => path.join(DATA_DIR, "users", String(id));
+const userPath = (id, name) => path.join(userDir(id), name);
+const readUserJson = (id, f, fallback) => {
+  try { return JSON.parse(fs.readFileSync(userPath(id, f), "utf8")); } catch { return fallback; }
+};
+const writeUserJson = (id, f, data) => {
+  if (!dataDirWritable) throw new Error("data directory is not writable");
+  fs.mkdirSync(userDir(id), { recursive: true });
+  const tmp = userPath(id, f + ".tmp");
+  fs.writeFileSync(tmp, JSON.stringify(data));
+  fs.renameSync(tmp, userPath(id, f)); // atomic-ish write
+};
+const verifyPassword = (user, pw) => {
+  if (!user) return false;
+  if (!user.hash) return true; // install was never password-protected
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(user.hash, "hex"),
+      Buffer.from(hashPassword(String(pw).trim(), user.salt), "hex")
+    );
+  } catch (e) { return false; }
+};
+
+/* one-time migration from the single-user layout */
+const USER_DATA_FILES = [
+  "forge.json", "forge-history.json", "whoop.json", "whoop-state.json",
+  "whoop-history.json", "push-subs.json", "push-prefs.json", "push-sent.json",
+  "ai-usage.json",
+];
+(function migrateSingleUser() {
+  if (!dataDirWritable) return;
+  const store = usersFile();
+  if (store.users && store.users.length) return; // already migrated
+  const legacyAuth = readJson("auth.json", {});
+  const pw = String(legacyAuth.password || process.env.APP_PASSWORD || "").trim();
+  const salt = crypto.randomBytes(16).toString("hex");
+  const admin = {
+    id: newUserId(),
+    name: (process.env.ADMIN_NAME || "Milst").trim(),
+    admin: true,
+    salt,
+    hash: pw ? hashPassword(pw, salt) : "",
+    createdAt: Date.now(),
+    lastLogin: null,
+  };
+  fs.mkdirSync(userDir(admin.id), { recursive: true });
+  let moved = 0;
+  for (const f of USER_DATA_FILES) {
+    try {
+      if (fs.existsSync(fileFor(f))) { fs.renameSync(fileFor(f), userPath(admin.id, f)); moved++; }
+    } catch (e) { console.error("[migrate] could not move", f, String(e.message || e)); }
+  }
+  saveUsers({ users: [admin], sessions: [] });
+  console.log(`[migrate] single-user install -> multi-user: ${moved} file(s) moved to users/${admin.id} (admin: ${admin.name})`);
+})();
+
+/* ---- auth: per-user password, session cookie, x-app-token fallback ----
+   The x-app-token header carries "<userId>:<password>" percent-encoded
+   (HTTP headers can't hold non-ASCII). It exists for browsers that drop
+   cookies in installed PWAs. */
+const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth", "/auth/login", "/auth/users", "/health"]);
 const parseCookies = (req) => {
   const out = {};
   String(req.headers.cookie || "").split(";").forEach((p) => {
@@ -55,26 +120,45 @@ const parseCookies = (req) => {
   });
   return out;
 };
-const tokenMatches = (raw) => {
-  const pw = currentPassword();
-  if (!pw) return true;
-  if (!raw) return false;
-  const candidates = [String(raw).trim()];
-  try { candidates.push(decodeURIComponent(String(raw)).trim()); } catch (e) {}
-  try { candidates.push(Buffer.from(String(raw), "base64").toString("utf8").trim()); } catch (e) {}
-  return candidates.includes(pw);
+const userFromToken = (raw) => {
+  if (!raw) return null;
+  let sTok = String(raw);
+  try { sTok = decodeURIComponent(sTok); } catch (e) {}
+  const i = sTok.indexOf(":");
+  if (i <= 0) return null;
+  const id = sTok.slice(0, i).trim();
+  const pw = sTok.slice(i + 1);
+  const user = (usersFile().users || []).find((u) => u.id === id);
+  return user && verifyPassword(user, pw) ? user : null;
 };
-const sessionOk = (req) => {
+const userFromSession = (req) => {
   const tok = parseCookies(req).forge_session;
-  if (!tok) return false;
-  const sessions = authFile().sessions || [];
-  return sessions.some((s) => s.token === tok && (!s.exp || s.exp > Date.now()));
+  if (!tok) return null;
+  const store = usersFile();
+  const sess = (store.sessions || []).find((x) => x.token === tok && (!x.exp || x.exp > Date.now()));
+  if (!sess) return null;
+  return (store.users || []).find((u) => u.id === sess.userId) || null;
 };
 app.use("/api", (req, res, next) => {
   if (OPEN_PATHS.has(req.path)) return next();
-  if (sessionOk(req) || tokenMatches(req.headers["x-app-token"])) return next();
+  const user = userFromSession(req) || userFromToken(req.headers["x-app-token"]);
+  if (user) { req.user = user; return next(); }
   return res.status(401).json({ error: "unauthorized" });
 });
+const requireAdmin = (req, res, next) =>
+  req.user && req.user.admin ? next() : res.status(403).json({ error: "admin only" });
+
+/* ---- per-user daily AI budget (admin is exempt) ---- */
+const aiUsage = (id) => {
+  const u = readUserJson(id, "ai-usage.json", {}) || {};
+  const today = dateInTz();
+  return u.date === today ? { date: today, count: +u.count || 0 } : { date: today, count: 0 };
+};
+const aiStatus = (user) => {
+  if (user.admin) return { used: 0, limit: null, left: null };
+  const u = aiUsage(user.id);
+  return { used: u.count, limit: AI_DAILY_LIMIT, left: Math.max(0, AI_DAILY_LIMIT - u.count) };
+};
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -95,41 +179,114 @@ const cookieFlags = () => {
   const secure = process.env.APP_URL ? "Secure; " : "";
   return `HttpOnly; ${secure}SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 30}`;
 };
+
+/* names only — the login screen needs the picker before auth */
+app.get("/api/auth/users", (_req, res) => {
+  res.json((usersFile().users || []).map((u) => ({ id: u.id, name: u.name, admin: !!u.admin })));
+});
 app.post("/api/auth/login", (req, res) => {
-  const pw = String((req.body && req.body.password) || "").trim();
-  if (currentPassword() && pw !== currentPassword()) {
+  const userId = String((req.body && req.body.userId) || "").trim();
+  const pw = String((req.body && req.body.password) || "");
+  const store = usersFile();
+  const user = (store.users || []).find((u) => u.id === userId);
+  if (!user || !verifyPassword(user, pw)) {
     return res.status(401).json({ error: "unauthorized" });
   }
   const token = crypto.randomBytes(24).toString("hex");
-  const auth = authFile();
-  auth.sessions = (auth.sessions || []).filter((s) => s.exp > Date.now()).slice(-8);
-  auth.sessions.push({ token, exp: Date.now() + 30 * 24 * 3600 * 1000, at: Date.now() });
-  writeJson("auth.json", auth);
+  store.sessions = (store.sessions || []).filter((x) => x.exp > Date.now()).slice(-40);
+  store.sessions.push({ token, userId: user.id, exp: Date.now() + 30 * 24 * 3600 * 1000, at: Date.now() });
+  user.lastLogin = Date.now();
+  saveUsers(store);
   res.setHeader("Set-Cookie", `forge_session=${token}; ${cookieFlags()}`);
-  res.json({ ok: true, session: true });
+  res.json({ ok: true, user: { id: user.id, name: user.name, admin: !!user.admin } });
+});
+app.get("/api/auth/me", (req, res) => {
+  res.json({ id: req.user.id, name: req.user.name, admin: !!req.user.admin, ai: aiStatus(req.user) });
 });
 app.post("/api/auth/logout", (req, res) => {
   const tok = parseCookies(req).forge_session;
-  const auth = authFile();
-  auth.sessions = (auth.sessions || []).filter((s) => s.token !== tok);
-  writeJson("auth.json", auth);
+  const store = usersFile();
+  store.sessions = (store.sessions || []).filter((x) => x.token !== tok);
+  saveUsers(store);
   res.setHeader("Set-Cookie", "forge_session=; HttpOnly; Path=/; Max-Age=0");
   res.json({ ok: true });
 });
 app.post("/api/auth/password", (req, res) => {
-  const current = String((req.body && req.body.current) || "").trim();
+  const current = String((req.body && req.body.current) || "");
   const next = String((req.body && req.body.next) || "").trim();
   if (!next || next.length < 4) return res.status(400).json({ error: "new password too short" });
-  if (currentPassword() && current !== currentPassword()) {
+  if (!verifyPassword(req.user, current)) {
     return res.status(401).json({ error: "current password does not match" });
   }
-  const auth = authFile();
-  auth.password = next;
-  auth.sessions = []; // force re-login
-  writeJson("auth.json", auth);
+  const store = usersFile();
+  const user = (store.users || []).find((u) => u.id === req.user.id);
+  if (!user) return res.status(400).json({ error: "user not found" });
+  user.salt = crypto.randomBytes(16).toString("hex");
+  user.hash = hashPassword(next, user.salt);
+  store.sessions = (store.sessions || []).filter((x) => x.userId !== user.id); // re-login on all devices
+  saveUsers(store);
   res.setHeader("Set-Cookie", "forge_session=; HttpOnly; Path=/; Max-Age=0");
   res.json({ ok: true });
 });
+
+/* ---- admin: manage users ---- */
+app.get("/api/users", requireAdmin, (req, res) => {
+  res.json((usersFile().users || []).map((u) => ({
+    id: u.id, name: u.name, admin: !!u.admin, lastLogin: u.lastLogin || null,
+    whoop: !!((readUserJson(u.id, "whoop.json", null) || {}).access_token),
+    aiToday: u.admin ? null : aiUsage(u.id).count,
+    aiLimit: u.admin ? null : AI_DAILY_LIMIT,
+  })));
+});
+app.post("/api/users", requireAdmin, (req, res) => {
+  const name = String((req.body && req.body.name) || "").trim().slice(0, 24);
+  const password = String((req.body && req.body.password) || "").trim();
+  if (!name) return res.status(400).json({ error: "name required" });
+  if (!password || password.length < 4) return res.status(400).json({ error: "password too short (min 4)" });
+  const store = usersFile();
+  if ((store.users || []).length >= MAX_USERS) {
+    return res.status(400).json({ error: `User limit reached (${MAX_USERS}).` });
+  }
+  if ((store.users || []).some((u) => u.name.toLowerCase() === name.toLowerCase())) {
+    return res.status(400).json({ error: "that name is taken" });
+  }
+  const salt = crypto.randomBytes(16).toString("hex");
+  const user = { id: newUserId(), name, admin: false, salt, hash: hashPassword(password, salt), createdAt: Date.now(), lastLogin: null };
+  store.users.push(user);
+  saveUsers(store);
+  fs.mkdirSync(userDir(user.id), { recursive: true });
+  res.json({ ok: true, user: { id: user.id, name: user.name } });
+});
+app.post("/api/users/:id/password", requireAdmin, (req, res) => {
+  const next = String((req.body && req.body.password) || "").trim();
+  if (!next || next.length < 4) return res.status(400).json({ error: "password too short (min 4)" });
+  const store = usersFile();
+  const user = (store.users || []).find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: "user not found" });
+  user.salt = crypto.randomBytes(16).toString("hex");
+  user.hash = hashPassword(next, user.salt);
+  store.sessions = (store.sessions || []).filter((x) => x.userId !== user.id);
+  saveUsers(store);
+  res.json({ ok: true });
+});
+app.delete("/api/users/:id", requireAdmin, (req, res) => {
+  const store = usersFile();
+  const user = (store.users || []).find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: "user not found" });
+  if (user.admin || user.id === req.user.id) return res.status(400).json({ error: "cannot remove the admin account" });
+  store.users = store.users.filter((u) => u.id !== user.id);
+  store.sessions = (store.sessions || []).filter((x) => x.userId !== user.id);
+  saveUsers(store);
+  /* keep the data — parked under trash/ instead of deleted */
+  try {
+    if (fs.existsSync(userDir(user.id))) {
+      fs.mkdirSync(path.join(DATA_DIR, "trash"), { recursive: true });
+      fs.renameSync(userDir(user.id), path.join(DATA_DIR, "trash", user.id + "-" + Date.now()));
+    }
+  } catch (e) { console.error("[users] could not park data dir:", String(e.message || e)); }
+  res.json({ ok: true });
+});
+
 
 /* ---- WHOOP integration (OAuth 2.0, v2 API) ----
    Create an app at developer.whoop.com, add redirect URL
@@ -138,7 +295,11 @@ app.post("/api/auth/password", (req, res) => {
 const WHOOP_HOST = "https://api.prod.whoop.com";
 const whoopConfigured = () => !!(process.env.WHOOP_CLIENT_ID && process.env.WHOOP_CLIENT_SECRET);
 const appUrl = (req) => (process.env.APP_URL || `https://${req.headers.host}`).replace(/\/$/, "");
-let whoopCache = { at: 0, data: null };
+const whoopCaches = new Map();
+const whoopCache = (id) => {
+  if (!whoopCaches.has(id)) whoopCaches.set(id, { at: 0, data: null });
+  return whoopCaches.get(id);
+};
 
 /* Legacy route from an older frontend. If this is reached, the browser is
    running a stale bundle — the current app POSTs to /whoop/auth-url instead. */
@@ -157,8 +318,8 @@ app.post("/api/whoop/auth-url", (req, res) => {
   if (!whoopConfigured()) {
     return res.status(400).json({ error: "WHOOP_CLIENT_ID / WHOOP_CLIENT_SECRET are not set on the server." });
   }
-  const state = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-  writeJson("whoop-state.json", { state, at: Date.now() });
+  const state = req.user.id + "." + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  writeUserJson(req.user.id, "whoop-state.json", { state, at: Date.now() });
   const u = new URL(WHOOP_HOST + "/oauth/oauth2/auth");
   u.searchParams.set("client_id", process.env.WHOOP_CLIENT_ID);
   u.searchParams.set("redirect_uri", appUrl(req) + "/api/whoop/callback");
@@ -171,28 +332,28 @@ app.post("/api/whoop/auth-url", (req, res) => {
 /* Diagnostics: shows what the server thinks its config is, without
    revealing secrets. Useful for checking the redirect URL matches. */
 app.get("/api/whoop/diag", (req, res) => {
-  const t = readJson("whoop.json", null);
+  const connectedUsers = (usersFile().users || [])
+    .filter((u) => !!((readUserJson(u.id, "whoop.json", null) || {}).access_token)).length;
   res.json({
-    password_protected: !!currentPassword(),
-    password_length: currentPassword() ? currentPassword().length : 0,
-    password_is_ascii: currentPassword() ? /^[\x20-\x7E]*$/.test(currentPassword()) : true,
+    users: (usersFile().users || []).length,
     client_id_set: !!process.env.WHOOP_CLIENT_ID,
     client_secret_set: !!process.env.WHOOP_CLIENT_SECRET,
     app_url_env: process.env.APP_URL || null,
     redirect_uri_used: appUrl(req) + "/api/whoop/callback",
-    connected: !!(t && t.access_token),
-    token_expires_in_min: t && t.expires_at ? Math.round((t.expires_at - Date.now()) / 60000) : null,
+    connected_users: connectedUsers,
     timezone: process.env.TIMEZONE || "UTC (set TIMEZONE)",
     auto_adjust: (process.env.AUTO_ADJUST || "on"),
   });
 });
 
 app.get("/api/whoop/callback", async (req, res) => {
-  const saved = readJson("whoop-state.json", {});
+  const stateUserId = String(req.query.state || "").split(".")[0];
+  const stateUser = (usersFile().users || []).find((u) => u.id === stateUserId) || null;
+  const saved = stateUser ? readUserJson(stateUser.id, "whoop-state.json", {}) : {};
   if (req.query.error) {
     return res.status(400).send(`WHOOP declined the request: ${req.query.error}. ${req.query.error_description || ""}`);
   }
-  if (!req.query.code || req.query.state !== saved.state) {
+  if (!stateUser || !req.query.code || req.query.state !== saved.state) {
     return res.status(400).send("OAuth state mismatch — go back to the app and tap Connect WHOOP again.");
   }
   try {
@@ -214,20 +375,20 @@ app.get("/api/whoop/callback", async (req, res) => {
       "doesn't exactly match:\n\n  " + appUrl(req) + "/api/whoop/callback\n\n" +
       "Check it character-for-character in the WHOOP Developer Dashboard, then try again.\n\nWHOOP said: " + JSON.stringify(tok)
     );
-    writeJson("whoop.json", {
+    writeUserJson(stateUser.id, "whoop.json", {
       access_token: tok.access_token,
       refresh_token: tok.refresh_token,
       expires_at: Date.now() + (tok.expires_in || 3600) * 1000,
     });
-    whoopCache = { at: 0, data: null };
+    whoopCaches.delete(stateUser.id);
     res.redirect("/");
   } catch (e) {
     res.status(502).send("WHOOP connection failed: " + String(e));
   }
 });
 
-async function whoopAccessToken() {
-  let t = readJson("whoop.json", null);
+async function whoopAccessToken(userId) {
+  let t = readUserJson(userId, "whoop.json", null);
   if (!t || !t.access_token) return null;
   if (Date.now() > (t.expires_at || 0) - 60000) {
     const body = new URLSearchParams({
@@ -249,18 +410,18 @@ async function whoopAccessToken() {
       refresh_token: tok.refresh_token || t.refresh_token,
       expires_at: Date.now() + (tok.expires_in || 3600) * 1000,
     };
-    writeJson("whoop.json", t);
+    writeUserJson(userId, "whoop.json", t);
   }
   return t.access_token;
 }
 
-app.get("/api/whoop/status", (_req, res) => {
-  const t = readJson("whoop.json", null);
+app.get("/api/whoop/status", (req, res) => {
+  const t = readUserJson(req.user.id, "whoop.json", null);
   res.json({ configured: whoopConfigured(), connected: !!(t && t.access_token) });
 });
 
-async function fetchWhoopSummary() {
-  const at = await whoopAccessToken();
+async function fetchWhoopSummary(userId) {
+  const at = await whoopAccessToken(userId);
   if (!at) return null;
   const j = async (p) => {
     const r = await fetch(WHOOP_HOST + "/developer/v2" + p, { headers: { Authorization: "Bearer " + at } });
@@ -317,33 +478,34 @@ async function fetchWhoopSummary() {
     stale: !!recoveryDate && recoveryDate !== today,                             // today's not scored yet
     updated: new Date().toISOString(),
   };
-  whoopCache = { at: Date.now(), data };
+  whoopCaches.set(userId, { at: Date.now(), data });
 
   // Persist a daily snapshot — correlations need history, not just today.
   try {
     const day = data.recoveryDate || dateInTz();
     if (data.recovery != null) {
-      const hist = readJson("whoop-history.json", []);
+      const hist = readUserJson(userId, "whoop-history.json", []);
       const rest = hist.filter((h) => h.date !== day);
       rest.push({
         date: day, recovery: data.recovery, hrv: data.hrv, rhr: data.rhr,
         sleepHours: data.sleepHours, sleepPerf: data.sleepPerf, strain: data.strain,
       });
       rest.sort((a, b) => (a.date < b.date ? -1 : 1));
-      writeJson("whoop-history.json", rest.slice(-400));
+      writeUserJson(userId, "whoop-history.json", rest.slice(-400));
     }
   } catch (e) { console.error("[whoop] history write failed", String(e.message || e)); }
 
   return data;
 }
 
-app.get("/api/whoop/summary", async (_req, res) => {
+app.get("/api/whoop/summary", async (req, res) => {
   // Fresh for 15 min normally — but only 2 min while we're still holding
   // yesterday's recovery, so today's shows up shortly after WHOOP scores it.
-  const ttl = whoopCache.data && whoopCache.data.stale ? 2 * 60 * 1000 : 15 * 60 * 1000;
-  if (whoopCache.data && Date.now() - whoopCache.at < ttl) return res.json(whoopCache.data);
+  const c = whoopCache(req.user.id);
+  const ttl = c.data && c.data.stale ? 2 * 60 * 1000 : 15 * 60 * 1000;
+  if (c.data && Date.now() - c.at < ttl) return res.json(c.data);
   try {
-    const data = await fetchWhoopSummary();
+    const data = await fetchWhoopSummary(req.user.id);
     if (!data) return res.status(400).json({ error: "not connected" });
     res.json(data);
   } catch (e) {
@@ -351,18 +513,18 @@ app.get("/api/whoop/summary", async (_req, res) => {
   }
 });
 
-app.get("/api/whoop/history", (_req, res) => res.json(readJson("whoop-history.json", [])));
+app.get("/api/whoop/history", (req, res) => res.json(readUserJson(req.user.id, "whoop-history.json", [])));
 
-app.post("/api/whoop/disconnect", (_req, res) => {
-  try { fs.unlinkSync(fileFor("whoop.json")); } catch (e) {}
-  whoopCache = { at: 0, data: null };
+app.post("/api/whoop/disconnect", (req, res) => {
+  try { fs.unlinkSync(userPath(req.user.id, "whoop.json")); } catch (e) {}
+  whoopCaches.delete(req.user.id);
   res.json({ ok: true });
 });
 
 /* ---- data endpoints + plan/data snapshots ---- */
-const snapshotPush = (reason, data) => {
+const snapshotPush = (userId, reason, data) => {
   try {
-    const hist = readJson("forge-history.json", []);
+    const hist = readUserJson(userId, "forge-history.json", []);
     hist.push({
       at: Date.now(),
       reason: reason || "save",
@@ -374,38 +536,41 @@ const snapshotPush = (reason, data) => {
         reviewedWeek: data.reviewedWeek,
       },
     });
-    writeJson("forge-history.json", hist.slice(-20));
+    writeUserJson(userId, "forge-history.json", hist.slice(-20));
   } catch (e) {
     console.error("[snapshot]", String(e.message || e));
   }
 };
 
-app.get("/api/data", (_req, res) => res.json(readJson("forge.json", {})));
+app.get("/api/data", (req, res) => res.json(readUserJson(req.user.id, "forge.json", {})));
 app.put("/api/data", (req, res) => {
   const incoming = req.body || {};
-  const prev = readJson("forge.json", {});
+  const prev = readUserJson(req.user.id, "forge.json", {});
   const planChanged = JSON.stringify(prev.plan || null) !== JSON.stringify(incoming.plan || null);
   const deletedWorkout = (prev.workouts || []).length > (incoming.workouts || []).length;
-  if (planChanged || deletedWorkout) snapshotPush(planChanged ? "plan" : "workout-delete", prev);
-  writeJson("forge.json", incoming);
+  if (planChanged || deletedWorkout) snapshotPush(req.user.id, planChanged ? "plan" : "workout-delete", prev);
+  writeUserJson(req.user.id, "forge.json", incoming);
   res.json({ ok: true, snapshotted: planChanged || deletedWorkout });
 });
-app.get("/api/data/history", (_req, res) => {
-  const hist = readJson("forge-history.json", []);
+app.get("/api/data/history", (req, res) => {
+  const hist = readUserJson(req.user.id, "forge-history.json", []);
   res.json(hist.map((h, i) => ({ i, at: h.at, reason: h.reason })));
 });
 app.post("/api/data/undo", (req, res) => {
-  const hist = readJson("forge-history.json", []);
+  const hist = readUserJson(req.user.id, "forge-history.json", []);
   const last = hist.pop();
   if (!last) return res.status(400).json({ error: "nothing to undo" });
-  const current = readJson("forge.json", {});
-  writeJson("forge.json", { ...current, ...last.data });
-  writeJson("forge-history.json", hist);
+  const current = readUserJson(req.user.id, "forge.json", {});
+  writeUserJson(req.user.id, "forge.json", { ...current, ...last.data });
+  writeUserJson(req.user.id, "forge-history.json", hist);
   res.json({ ok: true, restored: last.reason, at: last.at, data: { ...current, ...last.data } });
 });
+/* exinfo (AI-written exercise notes) is shared across users so a note one
+   person paid an AI call for benefits everyone — merged, never overwritten */
 app.get("/api/exinfo", (_req, res) => res.json(readJson("exinfo.json", {})));
 app.put("/api/exinfo", (req, res) => {
-  writeJson("exinfo.json", req.body || {});
+  const merged = { ...readJson("exinfo.json", {}), ...(req.body || {}) };
+  writeJson("exinfo.json", merged);
   res.json({ ok: true });
 });
 
@@ -546,9 +711,25 @@ async function callAI(prompt, maxTokens = 1500) {
 }
 
 app.post("/api/claude", async (req, res) => {
+  if (!req.user.admin) {
+    const u = aiUsage(req.user.id);
+    if (u.count >= AI_DAILY_LIMIT) {
+      return res.status(429).json({
+        error: `Daily AI limit reached (${AI_DAILY_LIMIT} calls). It resets at midnight.`,
+        ai: { used: u.count, limit: AI_DAILY_LIMIT, left: 0 },
+      });
+    }
+  }
   try {
     const text = await callAI(req.body.prompt, +req.body.max_tokens || 1500);
-    res.json({ text });
+    let ai = null;
+    if (!req.user.admin) {
+      const u = aiUsage(req.user.id);
+      u.count += 1;
+      writeUserJson(req.user.id, "ai-usage.json", u);
+      ai = { used: u.count, limit: AI_DAILY_LIMIT, left: Math.max(0, AI_DAILY_LIMIT - u.count) };
+    }
+    res.json({ text, ai });
   } catch (e) {
     console.error("[ai]", String(e.message || e));
     res.status(502).json({ error: String(e.message || e) });
@@ -602,7 +783,10 @@ async function autoAdjustCheck() {
   try {
     if ((process.env.AUTO_ADJUST || "on") === "off") return;
     if (!PROVIDER) return;
-    const data = readJson("forge.json", null);
+    const adminUser = (usersFile().users || []).find((u) => u.admin);
+    if (!adminUser) return;
+    const adminId = adminUser.id;
+    const data = readUserJson(adminId, "forge.json", null);
     if (!data || !data.profile || !data.plan || !Array.isArray(data.plan.week)) return;
     const today = dateInTz();
     const idx = weekdayIdxInTz();
@@ -610,13 +794,13 @@ async function autoAdjustCheck() {
     if (!canAutoAdjust({ plan: data.plan, workouts: data.workouts, today, todayIdx: idx })) return;
     const dy = data.plan.week[idx];
 
-    const sum = await fetchWhoopSummary();
+    const sum = await fetchWhoopSummary(adminId);
     if (!sum || sum.recovery == null) return;                      // WHOOP not connected / no data
     if (sum.stale || (sum.recoveryDate && sum.recoveryDate !== today)) return;                                  // hasn't synced today yet — retry next tick
 
     if (sum.recovery >= 67) {                                      // green: train as planned
       data.plan.adjustedDate = today;
-      writeJson("forge.json", data);
+      writeUserJson(adminId, "forge.json", data);
       console.log(`[auto-adjust] ${today}: recovery ${sum.recovery}% — no change needed`);
       return;
     }
@@ -643,7 +827,7 @@ Respond ONLY with valid JSON, no markdown fences:
     const text = await callAI(prompt, 1200);
     const adj = JSON.parse(text.replace(/```json|```/g, "").trim());
     const sanitized = sanitizePlan({ why: "", tip: "", week: data.plan.week.map((d, i) => i === idx ? adj : d) }, { profile: p });
-    snapshotPush("auto-adjust", data);
+    snapshotPush(adminId, "auto-adjust", data);
     data.plan = applyAutoAdjust(data.plan, {
       ...adj,
       exercises: sanitized.week[idx].exercises,
@@ -651,7 +835,7 @@ Respond ONLY with valid JSON, no markdown fences:
       adjustReason: reason.summary,
     }, { today, todayIdx: idx, neverSwapCompounds: !!p.neverSwapCompounds });
     delete data.plan.adjustUndone;
-    writeJson("forge.json", data);
+    writeUserJson(adminId, "forge.json", data);
     console.log(`[auto-adjust] ${today}: ${dy.day} adjusted for ${reason.summary}`);
   } catch (e) {
     console.error("[auto-adjust] failed:", String(e.message || e));
@@ -661,12 +845,15 @@ Respond ONLY with valid JSON, no markdown fences:
    when the app is closed. Goes through the cache, so it's a real WHOOP call
    only when the cached copy has expired. Then run the auto-adjust check. */
 async function whoopPoll() {
-  try {
-    const t = readJson("whoop.json", null);
-    if (!t || !t.access_token) return;
-    const ttl = whoopCache.data && whoopCache.data.stale ? 2 * 60 * 1000 : 15 * 60 * 1000;
-    if (!whoopCache.data || Date.now() - whoopCache.at >= ttl) await fetchWhoopSummary();
-  } catch (e) { console.error("[whoop] poll failed:", String(e.message || e)); }
+  for (const u of usersFile().users || []) {
+    try {
+      const t = readUserJson(u.id, "whoop.json", null);
+      if (!t || !t.access_token) continue;
+      const c = whoopCache(u.id);
+      const ttl = c.data && c.data.stale ? 2 * 60 * 1000 : 15 * 60 * 1000;
+      if (!c.data || Date.now() - c.at >= ttl) await fetchWhoopSummary(u.id);
+    } catch (e) { console.error("[whoop] poll failed:", u.name, String(e.message || e)); }
+  }
   await autoAdjustCheck();
 }
 setInterval(whoopPoll, 15 * 60 * 1000);
@@ -697,15 +884,15 @@ const VAPID_SUBJECT = (() => {
 })();
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
-const pushPrefs = () => ({ ...DEFAULT_PUSH_PREFS, ...(readJson("push-prefs.json", {}) || {}) });
-const pushSubs = () => readJson("push-subs.json", []);
-const savePushSubs = (list) => writeJson("push-subs.json", list);
+const pushPrefs = (userId) => ({ ...DEFAULT_PUSH_PREFS, ...(readUserJson(userId, "push-prefs.json", {}) || {}) });
+const pushSubs = (userId) => readUserJson(userId, "push-subs.json", []);
+const savePushSubs = (userId, list) => writeUserJson(userId, "push-subs.json", list);
 
 /* Send to every subscription, dropping the ones the push service says are dead.
    404/410 means the browser threw the subscription away — keeping it would
    make every future send fail. */
-async function pushSend(payload) {
-  const subs = pushSubs();
+async function pushSend(userId, payload) {
+  const subs = pushSubs(userId);
   if (!subs.length) return { sent: 0, dropped: 0 };
   const body = JSON.stringify(payload);
   let sent = 0;
@@ -725,15 +912,15 @@ async function pushSend(payload) {
       }
     }
   }
-  if (alive.length !== subs.length) savePushSubs(alive);
+  if (alive.length !== subs.length) savePushSubs(userId, alive);
   return { sent, dropped: subs.length - alive.length };
 }
 
-app.get("/api/push/config", (_req, res) => {
+app.get("/api/push/config", (req, res) => {
   res.json({
     publicKey: vapid.publicKey,
-    subscriptions: pushSubs().length,
-    prefs: pushPrefs(),
+    subscriptions: pushSubs(req.user.id).length,
+    prefs: pushPrefs(req.user.id),
     timezone: TZNAME,
   });
 });
@@ -741,22 +928,22 @@ app.get("/api/push/config", (_req, res) => {
 app.post("/api/push/subscribe", (req, res) => {
   const sub = req.body && req.body.subscription;
   if (!sub || !sub.endpoint) return res.status(400).json({ error: "missing subscription" });
-  const list = pushSubs().filter((s) => s.sub.endpoint !== sub.endpoint);
+  const list = pushSubs(req.user.id).filter((s) => s.sub.endpoint !== sub.endpoint);
   list.push({ sub, at: Date.now(), ua: String(req.headers["user-agent"] || "").slice(0, 160) });
-  savePushSubs(list.slice(-10)); // a handful of devices is plenty
+  savePushSubs(req.user.id, list.slice(-10)); // a handful of devices is plenty
   res.json({ ok: true, subscriptions: list.length });
 });
 
 app.post("/api/push/unsubscribe", (req, res) => {
   const ep = req.body && req.body.endpoint;
-  const list = pushSubs().filter((s) => s.sub.endpoint !== ep);
-  savePushSubs(list);
+  const list = pushSubs(req.user.id).filter((s) => s.sub.endpoint !== ep);
+  savePushSubs(req.user.id, list);
   res.json({ ok: true, subscriptions: list.length });
 });
 
 app.put("/api/push/prefs", (req, res) => {
   const incoming = req.body || {};
-  const next = { ...pushPrefs() };
+  const next = { ...pushPrefs(req.user.id) };
   ["train", "weigh", "unlogged", "adjusted"].forEach((k) => {
     if (typeof incoming[k] === "boolean") next[k] = incoming[k];
   });
@@ -764,13 +951,13 @@ app.put("/api/push/prefs", (req, res) => {
     const v = +incoming[k];
     if (Number.isInteger(v) && v >= 0 && v <= 23) next[k] = v;
   });
-  writeJson("push-prefs.json", next);
+  writeUserJson(req.user.id, "push-prefs.json", next);
   res.json({ ok: true, prefs: next });
 });
 
-app.post("/api/push/test", async (_req, res) => {
-  if (!pushSubs().length) return res.status(400).json({ error: "no devices subscribed" });
-  const out = await pushSend({
+app.post("/api/push/test", async (req, res) => {
+  if (!pushSubs(req.user.id).length) return res.status(400).json({ error: "no devices subscribed" });
+  const out = await pushSend(req.user.id, {
     title: "Forge",
     body: "Reminders are working. This is what they'll look like.",
     tag: "forge-test",
@@ -785,40 +972,42 @@ app.post("/api/push/test", async (_req, res) => {
 const hourInTz = () =>
   +new Intl.DateTimeFormat("en-GB", { timeZone: TZNAME, hour: "2-digit", hourCycle: "h23" }).format(new Date());
 
-function alreadySent(key) {
-  const log = readJson("push-sent.json", {});
+function alreadySent(userId, key) {
+  const log = readUserJson(userId, "push-sent.json", {});
   return !!log[key];
 }
-function markSent(key) {
-  const log = readJson("push-sent.json", {});
+function markSent(userId, key) {
+  const log = readUserJson(userId, "push-sent.json", {});
   log[key] = Date.now();
   // keep the file from growing forever
   const keys = Object.keys(log).sort();
   if (keys.length > 200) keys.slice(0, keys.length - 200).forEach((k) => delete log[k]);
-  writeJson("push-sent.json", log);
+  writeUserJson(userId, "push-sent.json", log);
 }
 
-async function fireOnce(key, payload) {
-  if (alreadySent(key)) return false;
-  markSent(key); // mark first: a failed send is better than a doubled one
-  const out = await pushSend(payload);
+async function fireOnce(userId, key, payload) {
+  if (alreadySent(userId, key)) return false;
+  markSent(userId, key); // mark first: a failed send is better than a doubled one
+  const out = await pushSend(userId, payload);
   console.log(`[push] ${key} -> ${out.sent} device(s)`);
   return true;
 }
 
 async function pushCheck() {
-  try {
-    if (!pushSubs().length) return;
-    const due = dueReminders({
-      data: readJson("forge.json", null),
-      prefs: pushPrefs(),
-      today: dateInTz(),
-      idx: weekdayIdxInTz(),
-      hour: hourInTz(),
-    });
-    for (const r of due) await fireOnce(r.key, r.payload);
-  } catch (e) {
-    console.error("[push] scheduler failed:", String(e.message || e));
+  for (const u of usersFile().users || []) {
+    try {
+      if (!pushSubs(u.id).length) continue;
+      const due = dueReminders({
+        data: readUserJson(u.id, "forge.json", null),
+        prefs: pushPrefs(u.id),
+        today: dateInTz(),
+        idx: weekdayIdxInTz(),
+        hour: hourInTz(),
+      });
+      for (const r of due) await fireOnce(u.id, r.key, r.payload);
+    } catch (e) {
+      console.error("[push] scheduler failed:", u.name, String(e.message || e));
+    }
   }
 }
 setInterval(pushCheck, 5 * 60 * 1000);
