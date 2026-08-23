@@ -152,7 +152,8 @@ const requireAdmin = (req, res, next) =>
 const aiUsage = (id) => {
   const u = readUserJson(id, "ai-usage.json", {}) || {};
   const today = dateInTz();
-  return u.date === today ? { date: today, count: +u.count || 0 } : { date: today, count: 0 };
+  const count = Math.min(Math.max(+u.count || 0, 0), AI_DAILY_LIMIT);
+  return u.date === today ? { date: today, count } : { date: today, count: 0 };
 };
 const aiStatus = (user) => {
   if (user.admin) return { used: 0, limit: null, left: null };
@@ -710,27 +711,45 @@ async function callAI(prompt, maxTokens = 1500) {
   return text;
 }
 
+/* Reserve the slot BEFORE the AI call, in one synchronous step. Checking
+   first and incrementing after the (slow) call is a race: two requests in
+   flight both pass the check and the counter overshoots the cap. A failed
+   call refunds its slot so errors don't eat the daily budget. */
+const aiReserve = (userId) => {
+  const u = aiUsage(userId);
+  if (u.count >= AI_DAILY_LIMIT) return null;
+  u.count += 1;
+  writeUserJson(userId, "ai-usage.json", u);
+  return u;
+};
+const aiRefund = (userId, date) => {
+  try {
+    const u = aiUsage(userId);
+    if (u.date === date && u.count > 0) {
+      u.count -= 1;
+      writeUserJson(userId, "ai-usage.json", u);
+    }
+  } catch (e) {}
+};
 app.post("/api/claude", async (req, res) => {
+  let reserved = null;
   if (!req.user.admin) {
-    const u = aiUsage(req.user.id);
-    if (u.count >= AI_DAILY_LIMIT) {
+    reserved = aiReserve(req.user.id);
+    if (!reserved) {
       return res.status(429).json({
         error: `Daily AI limit reached (${AI_DAILY_LIMIT} calls). It resets at midnight.`,
-        ai: { used: u.count, limit: AI_DAILY_LIMIT, left: 0 },
+        ai: { used: AI_DAILY_LIMIT, limit: AI_DAILY_LIMIT, left: 0 },
       });
     }
   }
   try {
     const text = await callAI(req.body.prompt, +req.body.max_tokens || 1500);
-    let ai = null;
-    if (!req.user.admin) {
-      const u = aiUsage(req.user.id);
-      u.count += 1;
-      writeUserJson(req.user.id, "ai-usage.json", u);
-      ai = { used: u.count, limit: AI_DAILY_LIMIT, left: Math.max(0, AI_DAILY_LIMIT - u.count) };
-    }
+    const ai = reserved
+      ? { used: reserved.count, limit: AI_DAILY_LIMIT, left: Math.max(0, AI_DAILY_LIMIT - reserved.count) }
+      : null;
     res.json({ text, ai });
   } catch (e) {
+    if (reserved) aiRefund(req.user.id, reserved.date);
     console.error("[ai]", String(e.message || e));
     res.status(502).json({ error: String(e.message || e) });
   }
