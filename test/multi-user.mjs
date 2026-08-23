@@ -15,8 +15,18 @@ const ok = (cond, name) => {
 
 /* ---- stub OpenAI so /api/claude succeeds and the counter moves ---- */
 const stub = http.createServer((req, res) => {
-  res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify({ choices: [{ message: { content: "{\"ok\":true}" }, finish_reason: "stop" }] }));
+  let raw = "";
+  req.on("data", (c) => (raw += c));
+  req.on("end", () => {
+    res.setHeader("content-type", "application/json");
+    const fail = raw.includes("FAIL_PLEASE");
+    /* the delay widens the race window: all concurrent requests are in
+       flight together, which is exactly what overshot the cap in prod */
+    setTimeout(() => {
+      if (fail) { res.statusCode = 500; res.end(JSON.stringify({ error: { message: "stub says no" } })); return; }
+      res.end(JSON.stringify({ choices: [{ message: { content: "{\"ok\":true}" }, finish_reason: "stop" }] }));
+    }, 150);
+  });
 });
 await new Promise((r) => stub.listen(3198, r));
 
@@ -135,6 +145,34 @@ r = await call("GET", "/api/data", { as: "juan" });
 ok(r.status === 401, "juan's session is dead after removal");
 ok(!fs.existsSync(path.join(DATA, "users", juanId)), "juan's folder no longer active");
 ok(fs.readdirSync(path.join(DATA, "trash")).some((d) => d.startsWith(juanId)), "juan's data parked in trash, not deleted");
+
+console.log("concurrency: the cap holds under parallel calls");
+r = await call("POST", "/api/users", { as: "admin", body: { name: "Sofi", password: "sofi1234" } });
+const sofiId = r.json.user.id;
+await call("POST", "/api/auth/login", { body: { userId: sofiId, password: "sofi1234" }, as: "sofi" });
+const burst = await Promise.all(
+  Array.from({ length: 6 }, () => call("POST", "/api/claude", { as: "sofi", body: { prompt: "hi" } }))
+);
+const okCount = burst.filter((x) => x.status === 200).length;
+const blocked = burst.filter((x) => x.status === 429).length;
+ok(okCount === 3, `exactly 3 of 6 parallel calls succeed (got ${okCount})`);
+ok(blocked === 3, `the other 3 get 429 (got ${blocked})`);
+r = await call("GET", "/api/users", { as: "admin" });
+const sofiRow = r.json.find((u) => u.id === sofiId);
+ok(sofiRow.aiToday === 3, `counter reads exactly 3, never over (got ${sofiRow.aiToday})`);
+r = await call("POST", "/api/claude", { as: "sofi", body: { prompt: "hi" } });
+ok(r.status === 429, "sofi stays blocked after the burst");
+
+console.log("refund: a failed AI call gives the slot back");
+r = await call("POST", "/api/users", { as: "admin", body: { name: "Rafa", password: "rafa1234" } });
+const rafaId = r.json.user.id;
+await call("POST", "/api/auth/login", { body: { userId: rafaId, password: "rafa1234" }, as: "rafa" });
+r = await call("POST", "/api/claude", { as: "rafa", body: { prompt: "FAIL_PLEASE" } });
+ok(r.status === 502, "upstream failure surfaces as 502");
+r = await call("GET", "/api/users", { as: "admin" });
+ok(r.json.find((u) => u.id === rafaId).aiToday === 0, "failed call did not consume the budget");
+r = await call("POST", "/api/claude", { as: "rafa", body: { prompt: "hi" } });
+ok(r.status === 200 && r.json.ai.used === 1, "next successful call counts normally");
 
 console.log("second boot is a no-op");
 const before = JSON.stringify(JSON.parse(fs.readFileSync(path.join(DATA, "users.json"), "utf8")).users.map((u) => u.id));
