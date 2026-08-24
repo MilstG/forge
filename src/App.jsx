@@ -885,6 +885,7 @@ export default function Forge() {
   });
   const [swapBusy, setSwapBusy] = useState(null);
   const [swapNote, setSwapNote] = useState("");
+  const [moveDay, setMoveDay] = useState(null);
   const [addInj, setAddInj] = useState("");
   const [addAvoid, setAddAvoid] = useState("");
   const [addPrefer, setAddPrefer] = useState("");
@@ -1133,13 +1134,50 @@ export default function Forge() {
     };
   }, [live, restEnd]);
 
+  /* Rest-over sound: the AudioContext must be created/resumed inside a tap,
+     so armRestSound runs off the "Log set" button and playRestBeep fires later. */
+  const audioCtx = useRef(null);
+  const armRestSound = () => {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!audioCtx.current) audioCtx.current = new AC();
+      if (audioCtx.current.state === "suspended") audioCtx.current.resume();
+    } catch (e) {}
+  };
+  const playRestBeep = () => {
+    try {
+      const ctx = audioCtx.current;
+      if (!ctx || ctx.state !== "running") return;
+      const t0 = ctx.currentTime;
+      [0, 0.22, 0.44].forEach((off, i) => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = i === 2 ? 1320 : 880;
+        g.gain.setValueAtTime(0.0001, t0 + off);
+        g.gain.exponentialRampToValueAtTime(0.5, t0 + off + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + off + 0.18);
+        o.connect(g); g.connect(ctx.destination);
+        o.start(t0 + off); o.stop(t0 + off + 0.2);
+      });
+    } catch (e) {}
+  };
+
   /* Buzz once when the rest timer hits zero. */
   const buzzed = useRef(false);
   useEffect(() => {
     if (!restEnd) { buzzed.current = false; return; }
     if (nowTs >= restEnd && !buzzed.current) {
       buzzed.current = true;
-      try { if (navigator.vibrate) navigator.vibrate([160, 90, 160]); } catch (e) {}
+      try { if (navigator.vibrate) navigator.vibrate([300, 110, 300, 110, 400]); } catch (e) {}
+      playRestBeep();
+      try {
+        if (document.hidden && "Notification" in window && Notification.permission === "granted" && navigator.serviceWorker) {
+          navigator.serviceWorker.ready.then((reg) => reg.showNotification("Rest over", {
+            body: "Back to the bar \u2014 next set.", tag: "forge-rest",
+            icon: "/icon-192.png", badge: "/icon-192.png",
+          })).catch(() => {});
+        }
+      } catch (e) {}
     }
   }, [nowTs, restEnd]);
 
@@ -2063,6 +2101,24 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
       setTimeout(() => setSwapNote(""), 4000);
     }
     setSwapBusy(null);
+  };
+
+  /* ----- move a session to another day (swap contents, keep day labels) ----- */
+  const moveSession = (from, to) => {
+    if (!plan || !plan.week || from === to || !plan.week[from] || !plan.week[to]) { setMoveDay(null); return; }
+    if (doneDays.has(to) && !window.confirm("You already trained that day. Swap the sessions anyway?")) return;
+    const np = JSON.parse(JSON.stringify(plan));
+    const { day: da, ...contentA } = np.week[from];
+    const { day: db, ...contentB } = np.week[to];
+    np.week[from] = { day: da, ...contentB };
+    np.week[to] = { day: db, ...contentA };
+    if (np.originalDay && (np.originalDay.idx === from || np.originalDay.idx === to)) {
+      np.originalDay.idx = np.originalDay.idx === from ? to : from;
+    }
+    setPlan(np);
+    persist({ plan: np });
+    setMoveDay(null);
+    setOpenDay(to);
   };
 
   /* ----- nutrition ----- */
@@ -3529,6 +3585,33 @@ Respond ONLY with valid JSON, no markdown fences:
                           <button style={{ ...S.ghost, width: "100%", marginTop: 8 }} onClick={() => sendToLog(dy)}>
                             Prefill the log form instead
                           </button>
+                          <button style={{ ...S.ghost, width: "100%", marginTop: 8 }}
+                            onClick={() => setMoveDay(moveDay === openDay ? null : openDay)}>
+                            {moveDay === openDay ? "Cancel move" : "⇅ Move to another day"}
+                          </button>
+                          {moveDay === openDay && (
+                            <div style={{ marginTop: 10 }}>
+                              <span style={S.label}>Swap this session with…</span>
+                              <div style={{ display: "flex", gap: 5 }}>
+                                {plan.week.map((d2, i2) => {
+                                  if (i2 === openDay) return <div key={i2} style={{ flex: 1 }} />;
+                                  const trained = doneDays.has(i2);
+                                  return (
+                                    <button key={i2} onClick={() => moveSession(openDay, i2)} style={{
+                                      flex: 1, padding: "9px 0", borderRadius: 8, cursor: "pointer",
+                                      border: `1px solid ${T.line}`, background: T.surface2,
+                                      color: trained ? T.dim : d2.rest ? T.sub : T.text,
+                                    }}>
+                                      <div style={{ ...mono, fontSize: 10, textTransform: "uppercase" }}>{d2.day}</div>
+                                      <div style={{ fontSize: 9, marginTop: 3, color: trained ? T.good : d2.rest ? T.dim : T.sub }}>
+                                        {trained ? "done" : d2.rest ? "rest" : "•"}
+                                      </div>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
                         </>
                       )}
                     </div>
@@ -3663,6 +3746,40 @@ Respond ONLY with valid JSON, no markdown fences:
                   </div>
                 </div>
 
+                {!isTimedEx(ex) && (() => {
+                  const nxt = live.exercises[live.idx + 1];
+                  const prv = live.exercises[live.idx - 1];
+                  const linkedPrev = !!(prv && prv.supersetWithNext);
+                  const canLink = !linkedPrev && nxt && !isTimedEx(nxt);
+                  if (!canLink && !linkedPrev) return null;
+                  return (
+                    <div style={{ margin: "2px 0 8px" }}>
+                      {linkedPrev ? (
+                        <div style={{
+                          fontSize: 12, color: T.blue, background: T.blueDim,
+                          border: `1px solid ${T.line}`, borderRadius: 8, padding: "7px 10px",
+                        }}>
+                          ⧉ Superset with {prv.name} — rest starts after this set
+                        </div>
+                      ) : (
+                        <button onClick={() => updLive((nl) => {
+                          nl.exercises[nl.idx].supersetWithNext = !nl.exercises[nl.idx].supersetWithNext;
+                        }, true)} style={{
+                          width: "100%", textAlign: "left", cursor: "pointer", fontSize: 12,
+                          borderRadius: 8, padding: "7px 10px", fontFamily: "inherit",
+                          background: ex.supersetWithNext ? T.blueDim : T.surface2,
+                          border: `1px solid ${ex.supersetWithNext ? T.blue : T.line}`,
+                          color: ex.supersetWithNext ? T.blue : T.sub,
+                        }}>
+                          {ex.supersetWithNext
+                            ? `⧉ Superset on — each set jumps to ${nxt.name}, no rest between`
+                            : `⧉ Superset with ${nxt.name}`}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {(() => {
                   if (isTimedEx(ex)) return null;
                   const ww = parseFloat(((ex.sets.find((s) => !s.done) || ex.sets[0]) || {}).weight);
@@ -3764,8 +3881,17 @@ Respond ONLY with valid JSON, no markdown fences:
                     <button
                       onClick={() => {
                         if (s.done) { updLive((nl) => { nl.exercises[nl.idx].sets[si].done = false; }, true); return; }
-                        updLive((nl) => { nl.exercises[nl.idx].sets[si].done = true; }, true);
-                        setRestEnd(Date.now() + restSecs * 1000);
+                        const nxt = live.exercises[live.idx + 1];
+                        const prv = live.exercises[live.idx - 1];
+                        const toPartner = !!(ex.supersetWithNext && nxt && !isTimedEx(nxt) && nxt.sets.some((x) => !x.done));
+                        const backToA = !toPartner && !!(prv && prv.supersetWithNext && prv.sets.some((x) => !x.done));
+                        updLive((nl) => {
+                          nl.exercises[nl.idx].sets[si].done = true;
+                          if (toPartner) nl.idx++;
+                          else if (backToA) nl.idx--;
+                        }, true);
+                        if (toPartner) { setRestEnd(null); }
+                        else { armRestSound(); setRestEnd(Date.now() + restSecs * 1000); }
                       }}
                       style={{
                         flex: 1, padding: "11px 0", borderRadius: 8, cursor: "pointer", fontSize: 11.5,
