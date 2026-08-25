@@ -146,6 +146,33 @@ const groupFor = (name) => {
   return "Other";
 };
 
+/* ================= post-workout cool-down =================
+   New plans carry a per-day `cooldown` written by the coach. Plans built
+   before the field existed fall back to stretches derived from the muscle
+   groups actually trained that day, so nobody has to rebuild a plan. */
+const STRETCHES = {
+  Legs: "standing quad stretch + deep squat hold",
+  Hamstrings: "standing hamstring fold, knees soft",
+  Glutes: "figure-4 stretch each side",
+  Back: "child's pose + hanging lat stretch",
+  Chest: "doorway pec stretch each side",
+  Shoulders: "cross-body shoulder stretch each side",
+  Arms: "overhead triceps + wall biceps stretch",
+  Core: "cobra stretch",
+  Cardio: "easy 3-5 min walk + wall calf stretch",
+};
+const cooldownFor = (dy) => {
+  if (!dy || dy.rest) return "";
+  if (dy.cooldown) return dy.cooldown;
+  const seen = [];
+  (dy.exercises || []).forEach((e) => {
+    const g = groupFor(e.exercise || e.name);
+    if (STRETCHES[g] && !seen.includes(g)) seen.push(g);
+  });
+  if (!seen.length) return "5 min easy walk, then 5 slow breaths: 4s in, 6s out.";
+  return `Hold 30-45s per side, easy breathing: ${seen.slice(0, 4).map((g) => STRETCHES[g]).join("; ")}. Finish with 5 slow nasal breaths.`;
+};
+
 /* ================= time-based movements =================
    Cardio, holds and carries can't be logged as sets × reps × kg —
    the honest unit is minutes (plus distance where it exists). An
@@ -1883,7 +1910,7 @@ Athlete:
 - Rep-range mismatch: their goal calls for ${goalRange} reps but only ${repRanges.pct[goalRange]}% of sets are there. Correct this.` : ""}${stale.length ? `
 - Movements they have dropped for 3+ weeks: ${stale.map((e) => e.name).join(", ")}. Reintroduce if useful.` : ""}
 
-Build a full 7-day week, Monday to Sunday, with exactly ${p.days} training days and ${7 - p.days} rest days. Place rest days sensibly for recovery. Use ONLY the available equipment. Progress loads in small steps vs their history. Serve the specific goals directly. Give every TRAINING day its own one-line warm-up that primes the specific muscles and movements in that session. On rest days give a one-line recovery suggestion (walk, stretch, mobility) instead.
+Build a full 7-day week, Monday to Sunday, with exactly ${p.days} training days and ${7 - p.days} rest days. Place rest days sensibly for recovery. Use ONLY the available equipment. Progress loads in small steps vs their history. Serve the specific goals directly. Give every TRAINING day its own one-line warm-up that primes the specific muscles and movements in that session, AND its own one-line cool-down: 3-4 named post-workout stretches targeting exactly the muscles trained that day, with hold times, to limit next-day soreness. On rest days give a one-line recovery suggestion (walk, stretch, mobility) instead.
 ${deloadNow ? "IMPORTANT: This must be a DELOAD week. Cut loads to roughly 60% of their recent working weights and reduce total sets by about 40%. Keep the same movement patterns, keep everything far from failure, and say in \"why\" that this is a recovery week and why it earns them progress." : ""}
 
 Respond ONLY with valid JSON, no markdown fences, no preamble:
@@ -1891,7 +1918,7 @@ Respond ONLY with valid JSON, no markdown fences, no preamble:
  "why": "2-3 sentences on the structure of this week and how it serves their goals",
  "tip": "one specific coaching tip for this athlete right now",
  "week": [
-  {"day":"Mon","rest":false,"focus":"short session title","warmup":"one line warm-up specific to this session, e.g. 5 min bike then hip openers and 2 light sets of the first lift","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short load guidance"}]},
+  {"day":"Mon","rest":false,"focus":"short session title","warmup":"one line warm-up specific to this session, e.g. 5 min bike then hip openers and 2 light sets of the first lift","cooldown":"one line: 3-4 named stretches for exactly today's muscles, with hold times, e.g. figure-4 glutes 40s per side; standing hamstring fold 40s; child's pose 60s","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short load guidance"}]},
   For cardio, carries or holds (run, bike, walk, row, swim, jump rope, plank, farmer's walk), use minutes instead of sets and reps: {"exercise":"Run","minutes":30,"load":"conversational pace, zone 2"}.
   {"day":"Tue","rest":true,"note":"one-line recovery suggestion"}
  ]
@@ -1964,6 +1991,7 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
     const lv = {
       startedAt: Date.now(), date: todayStr, idx: 0, focus: dayObj.focus || "",
       warmup: dayObj.warmup || "", warmupDone: false,
+      cooldown: cooldownFor(dayObj),
       checkin: todayCheckin ? { ...todayCheckin, saved: true } : null,
       exercises: sessionEx,
     };
@@ -2271,7 +2299,7 @@ Rules:
 ${profile.neverSwapCompounds ? "- Do NOT replace squat/bench/deadlift/press/row — only change load, sets or reps." : ""}
 
 Respond ONLY with valid JSON, no markdown fences:
-{"day":"${dy.day}","rest":false,"focus":"session title","warmup":"one line warm-up for this session","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
+{"day":"${dy.day}","rest":false,"focus":"session title","warmup":"one line warm-up for this session","cooldown":"one line: 3-4 named stretches for today's muscles with hold times","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
     try {
       const clean = await askClaude(prompt, 1200);
       const adj = parseJson(clean);
@@ -3579,6 +3607,22 @@ Respond ONLY with valid JSON, no markdown fences:
                           {swapNote && (
                             <div style={{ fontSize: 12.5, color: T.blue, padding: "9px 0 0" }}>{swapNote}</div>
                           )}
+                          {(() => {
+                            const cool = cooldownFor(dy);
+                            if (!cool) return null;
+                            return (
+                              <div style={{
+                                background: T.blueDim, borderLeft: `2px solid ${T.blue}`, borderRadius: 8,
+                                padding: "10px 13px", margin: "12px 0 0", fontSize: 13, lineHeight: 1.5,
+                              }}>
+                                <span style={{
+                                  fontSize: 9.5, color: T.blue, textTransform: "uppercase",
+                                  letterSpacing: "0.14em", fontWeight: 600, display: "block", marginBottom: 4,
+                                }}>Cool-down · after the session</span>
+                                {cool}
+                              </div>
+                            );
+                          })()}
                           <button style={{ ...S.btn, marginTop: 14 }} onClick={() => startLive(dy)}>
                             ▶ Start live session
                           </button>
@@ -3935,6 +3979,20 @@ Respond ONLY with valid JSON, no markdown fences:
                 </button>
               </div>
 
+              {totalDone > 0 && (() => {
+                const cool = live.cooldown
+                  || cooldownFor({ rest: false, exercises: live.exercises.map((x) => ({ exercise: x.name })) });
+                if (!cool) return null;
+                return (
+                  <div style={{ ...S.card, background: T.blueDim, borderColor: T.line, borderLeft: `2px solid ${T.blue}` }}>
+                    <div style={{
+                      fontSize: 9.5, color: T.blue, textTransform: "uppercase",
+                      letterSpacing: "0.14em", fontWeight: 600, marginBottom: 6,
+                    }}>Cool-down before you finish</div>
+                    <div style={{ fontSize: 14, lineHeight: 1.55 }}>{cool}</div>
+                  </div>
+                );
+              })()}
               <button style={{ ...S.btn, opacity: totalDone ? 1 : 0.5 }} disabled={!totalDone} onClick={finishLive}>
                 Finish session ({totalDone} sets)
               </button>
