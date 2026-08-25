@@ -38,6 +38,7 @@ export function normalizeDay(raw = {}, idx = 0, opts = {}) {
     rest: false,
     focus: String(raw.focus || "Training"),
     warmup: String(raw.warmup || ""),
+    cooldown: String(raw.cooldown || ""),
     exercises,
   };
 }

@@ -53,6 +53,7 @@ export function applyAutoAdjust(plan, adj, { today, todayIdx, neverSwapCompounds
     rest: false,
     focus: (adj && adj.focus) || dy.focus,
     warmup: (adj && adj.warmup) || dy.warmup,
+    cooldown: (adj && adj.cooldown) || dy.cooldown || "",
     exercises: (adj && adj.exercises) || dy.exercises,
   };
   const day = neverSwapCompounds ? keepCompounds(dy, incoming) : incoming;
