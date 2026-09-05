@@ -932,8 +932,7 @@ export default function Forge() {
   const [pwErr, setPwErr] = useState("");
   const [me, setMe] = useState(null);
   const [aiQuota, setAiQuota] = useState(null);
-  const [loginUsers, setLoginUsers] = useState(null);
-  const [selUser, setSelUser] = useState(null);
+  const [loginName, setLoginName] = useState("");
   const [adminUsers, setAdminUsers] = useState(null);
   const [nuName, setNuName] = useState("");
   const [nuPw, setNuPw] = useState("");
@@ -1042,20 +1041,6 @@ export default function Forge() {
       } catch (e) {}
     })();
   }, [me, tab, adminUsers]);
-  /* the login screen needs the user list before any auth exists */
-  useEffect(() => {
-    if (!authNeeded || loginUsers) return;
-    (async () => {
-      try {
-        const r = await fetch("/api/auth/users");
-        if (r.ok) {
-          const list = await r.json();
-          setLoginUsers(list);
-          if (list.length === 1) setSelUser(list[0].id);
-        } else setLoginUsers([]);
-      } catch (e) { setLoginUsers([]); }
-    })();
-  }, [authNeeded, loginUsers]);
 
   /* WHOOP: re-fetch whenever the app comes back to the foreground and every
      15 min while visible. A PWA left open overnight otherwise keeps showing
@@ -1087,17 +1072,19 @@ export default function Forge() {
 
   const unlock = async () => {
     const val = pw.trim();
-    if (!selUser) { setPwErr("Pick who you are first."); return; }
+    const name = loginName.trim();
+    if (!name) { setPwErr("Type your username first."); return; }
     setPwErr("");
     try {
       const lr = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId: selUser, password: val }),
+        body: JSON.stringify({ username: name, password: val }),
       });
-      if (lr.status === 401) { setPwErr("That password doesn't match this account."); return; }
+      if (lr.status === 401) { setPwErr("Wrong username or password."); return; }
       if (!lr.ok) { setPwErr("Server error — try again in a moment."); return; }
-      const combined = selUser + ":" + val;
+      const who = await lr.json();
+      const combined = who.user.id + ":" + val;
       try { localStorage.setItem("forge-token", combined); } catch (e) {
         /* cookie session still works even if storage is blocked */
       }
@@ -2832,31 +2819,11 @@ Respond ONLY with valid JSON, no markdown fences:
           <div style={{ ...S.card, width: 300 }}>
             <div style={{ ...display, fontSize: 30, marginBottom: 6, letterSpacing: "0.06em" }}>Forge<span style={{ color: T.accent }}>.</span></div>
             <p style={{ color: T.sub, fontSize: 13, marginTop: 0 }}>Who's training?</p>
-            {loginUsers === null && <p style={{ color: T.dim, fontSize: 13 }}>Loading…</p>}
-            {loginUsers && loginUsers.length === 0 && (
-              <p style={{ color: T.sub, fontSize: 12.5 }}>No accounts found — the server may still be starting. Reload in a moment.</p>
-            )}
-            {loginUsers && loginUsers.length > 0 && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
-                {loginUsers.map((u) => (
-                  <button key={u.id} onClick={() => { setSelUser(u.id); setPwErr(""); }}
-                    style={{
-                      ...S.ghost, padding: "12px 6px", display: "flex", flexDirection: "column",
-                      alignItems: "center", gap: 6,
-                      border: `1.5px solid ${selUser === u.id ? T.accent : T.line}`,
-                      background: selUser === u.id ? T.accentDim || "transparent" : "transparent",
-                    }}>
-                    <span style={{
-                      width: 36, height: 36, borderRadius: "50%", display: "flex", alignItems: "center",
-                      justifyContent: "center", fontWeight: 800, fontSize: 15,
-                      background: selUser === u.id ? T.accent : T.line, color: selUser === u.id ? "#fff" : T.sub,
-                    }}>{(u.name || "?").slice(0, 1).toUpperCase()}</span>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: T.text }}>{u.name}</span>
-                    {u.admin && <span style={{ fontSize: 10.5, color: T.dim }}>admin</span>}
-                  </button>
-                ))}
-              </div>
-            )}
+            <span style={S.label}>Username</span>
+            <input type="text" value={loginName} autoComplete="username" autoCapitalize="none"
+              onChange={(e) => { setLoginName(e.target.value); setPwErr(""); }}
+              onKeyDown={(e) => e.key === "Enter" && unlock()}
+              style={{ ...S.input, marginBottom: 12 }} />
             <span style={S.label}>Password</span>
             <input type="password" value={pw}
               onChange={(e) => setPw(e.target.value)}

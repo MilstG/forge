@@ -46,7 +46,7 @@ const writeJson = (f, data) => {
    file moves into users/<id>/. Shared files (vapid.json, exinfo.json,
    users.json) stay at the volume root. */
 const MAX_USERS = 6;
-const AI_DAILY_LIMIT = 3;
+const AI_DAILY_LIMIT = 10;
 const hashPassword = (pw, salt) => crypto.scryptSync(String(pw), salt, 32).toString("hex");
 const newUserId = () => crypto.randomBytes(6).toString("hex");
 const usersFile = () => readJson("users.json", { users: [], sessions: [] });
@@ -111,7 +111,7 @@ const USER_DATA_FILES = [
    The x-app-token header carries "<userId>:<password>" percent-encoded
    (HTTP headers can't hold non-ASCII). It exists for browsers that drop
    cookies in installed PWAs. */
-const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth", "/auth/login", "/auth/users", "/health"]);
+const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth", "/auth/login", "/health"]);
 const parseCookies = (req) => {
   const out = {};
   String(req.headers.cookie || "").split(";").forEach((p) => {
@@ -181,15 +181,17 @@ const cookieFlags = () => {
   return `HttpOnly; ${secure}SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 30}`;
 };
 
-/* names only — the login screen needs the picker before auth */
-app.get("/api/auth/users", (_req, res) => {
-  res.json((usersFile().users || []).map((u) => ({ id: u.id, name: u.name, admin: !!u.admin })));
-});
+/* Login takes a typed username; the old user-picker endpoint is gone so
+   account names are no longer enumerable before auth. userId is still
+   accepted for stored tokens and older clients. */
 app.post("/api/auth/login", (req, res) => {
   const userId = String((req.body && req.body.userId) || "").trim();
+  const username = String((req.body && req.body.username) || "").trim();
   const pw = String((req.body && req.body.password) || "");
   const store = usersFile();
-  const user = (store.users || []).find((u) => u.id === userId);
+  const user = (store.users || []).find((u) =>
+    userId ? u.id === userId : username && u.name.toLowerCase() === username.toLowerCase()
+  );
   if (!user || !verifyPassword(user, pw)) {
     return res.status(401).json({ error: "unauthorized" });
   }

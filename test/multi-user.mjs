@@ -76,11 +76,13 @@ ok(fs.existsSync(path.join(DATA, "users", admin.id, "whoop-history.json")), "who
 
 console.log("auth");
 let r = await call("GET", "/api/auth/users");
-ok(r.status === 200 && r.json.length === 1 && !r.json[0].hash && !r.json[0].salt, "public user list has names only");
-r = await call("POST", "/api/auth/login", { body: { userId: admin.id, password: "wrong" } });
+ok(r.status === 401, "pre-auth user list is gone — accounts are not enumerable");
+r = await call("POST", "/api/auth/login", { body: { username: "Milst", password: "wrong" } });
 ok(r.status === 401, "wrong password rejected");
-r = await call("POST", "/api/auth/login", { body: { userId: admin.id, password: "oldpw" }, as: "admin" });
-ok(r.status === 200 && r.json.user.admin, "auth.json override password wins over APP_PASSWORD (old behaviour kept)");
+r = await call("POST", "/api/auth/login", { body: { username: "nobody", password: "oldpw" } });
+ok(r.status === 401, "unknown username rejected");
+r = await call("POST", "/api/auth/login", { body: { username: "milst", password: "oldpw" }, as: "admin" });
+ok(r.status === 200 && r.json.user.admin, "username login (case-insensitive) works; auth.json override password wins over APP_PASSWORD");
 r = await call("GET", "/api/data", { as: "admin" });
 ok(r.status === 200 && r.json.profile && r.json.profile.goal === "strength", "admin sees the migrated data");
 r = await call("GET", "/api/data", { token: admin.id + ":oldpw" });
@@ -98,8 +100,10 @@ ok(r.status === 200, "admin can add a user");
 const juanId = r.json.user.id;
 r = await call("POST", "/api/users", { as: "admin", body: { name: "juan", password: "x2345" } });
 ok(r.status === 400, "duplicate name (case-insensitive) rejected");
-r = await call("POST", "/api/auth/login", { body: { userId: juanId, password: "temp1234" }, as: "juan" });
-ok(r.status === 200 && r.json.user.name === "Juan", "new user can log in");
+r = await call("POST", "/api/auth/login", { body: { username: "Juan", password: "temp1234" }, as: "juan" });
+ok(r.status === 200 && r.json.user.name === "Juan", "new user can log in with username");
+r = await call("POST", "/api/auth/login", { body: { userId: juanId, password: "temp1234" } });
+ok(r.status === 200, "legacy userId login still accepted (stored tokens keep working)");
 r = await call("GET", "/api/users", { as: "juan" });
 ok(r.status === 403, "non-admin cannot list users");
 
@@ -119,16 +123,17 @@ r = await call("GET", "/api/exinfo", { as: "admin" });
 ok(r.json.squat === "a" && r.json.bench === "b", "shared exinfo merges instead of overwriting");
 
 console.log("AI rate limit");
-for (let i = 1; i <= 3; i++) {
+const LIMIT = 10;
+for (let i = 1; i <= LIMIT; i++) {
   r = await call("POST", "/api/claude", { as: "juan", body: { prompt: "hi" } });
-  ok(r.status === 200 && r.json.ai.used === i && r.json.ai.left === 3 - i, `call ${i} allowed, counter at ${i}`);
+  ok(r.status === 200 && r.json.ai.used === i && r.json.ai.left === LIMIT - i, `call ${i} allowed, counter at ${i}`);
 }
 r = await call("POST", "/api/claude", { as: "juan", body: { prompt: "hi" } });
-ok(r.status === 429 && /limit/i.test(r.json.error), "4th call blocked with 429");
+ok(r.status === 429 && /limit/i.test(r.json.error), `call ${LIMIT + 1} blocked with 429`);
 r = await call("POST", "/api/claude", { as: "admin", body: { prompt: "hi" } });
 ok(r.status === 200 && r.json.ai === null, "admin calls are uncounted");
 r = await call("GET", "/api/users", { as: "admin" });
-ok(r.json.find((u) => u.id === juanId).aiToday === 3, "admin panel shows juan's usage");
+ok(r.json.find((u) => u.id === juanId).aiToday === LIMIT, "admin panel shows juan's usage");
 
 console.log("password reset + removal");
 r = await call("POST", `/api/users/${juanId}/password`, { as: "admin", body: { password: "newpw99" } });
@@ -149,17 +154,17 @@ ok(fs.readdirSync(path.join(DATA, "trash")).some((d) => d.startsWith(juanId)), "
 console.log("concurrency: the cap holds under parallel calls");
 r = await call("POST", "/api/users", { as: "admin", body: { name: "Sofi", password: "sofi1234" } });
 const sofiId = r.json.user.id;
-await call("POST", "/api/auth/login", { body: { userId: sofiId, password: "sofi1234" }, as: "sofi" });
+await call("POST", "/api/auth/login", { body: { username: "Sofi", password: "sofi1234" }, as: "sofi" });
 const burst = await Promise.all(
-  Array.from({ length: 6 }, () => call("POST", "/api/claude", { as: "sofi", body: { prompt: "hi" } }))
+  Array.from({ length: LIMIT + 4 }, () => call("POST", "/api/claude", { as: "sofi", body: { prompt: "hi" } }))
 );
 const okCount = burst.filter((x) => x.status === 200).length;
 const blocked = burst.filter((x) => x.status === 429).length;
-ok(okCount === 3, `exactly 3 of 6 parallel calls succeed (got ${okCount})`);
-ok(blocked === 3, `the other 3 get 429 (got ${blocked})`);
+ok(okCount === LIMIT, `exactly ${LIMIT} of ${LIMIT + 4} parallel calls succeed (got ${okCount})`);
+ok(blocked === 4, `the other 4 get 429 (got ${blocked})`);
 r = await call("GET", "/api/users", { as: "admin" });
 const sofiRow = r.json.find((u) => u.id === sofiId);
-ok(sofiRow.aiToday === 3, `counter reads exactly 3, never over (got ${sofiRow.aiToday})`);
+ok(sofiRow.aiToday === LIMIT, `counter reads exactly ${LIMIT}, never over (got ${sofiRow.aiToday})`);
 r = await call("POST", "/api/claude", { as: "sofi", body: { prompt: "hi" } });
 ok(r.status === 429, "sofi stays blocked after the burst");
 
