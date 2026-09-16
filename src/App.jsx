@@ -925,6 +925,8 @@ export default function Forge() {
   const [adjBusy, setAdjBusy] = useState(false);
   const autoAdj = useRef(false);
   const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  const [swUpdate, setSwUpdate] = useState(null);        // SW registration with a new build waiting
+  const [swUpdateHidden, setSwUpdateHidden] = useState(false); // ✕ hides the pill until next launch
   const [queued, setQueued] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
@@ -1804,13 +1806,15 @@ export default function Forge() {
       navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then((reg) => {
         reg.update().catch(() => {});
         setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+        /* an update may already be sitting there from a previous visit */
+        if (reg.waiting && navigator.serviceWorker.controller) setSwUpdate(reg);
         reg.addEventListener("updatefound", () => {
           const sw = reg.installing;
           if (!sw) return;
           sw.addEventListener("statechange", () => {
-            /* a new worker took over an existing page: reload once to run it */
+            /* a new build is installed and waiting: offer it, never force it */
             if (sw.state === "installed" && navigator.serviceWorker.controller) {
-              sw.postMessage("skip-waiting");
+              setSwUpdate(reg);
             }
           });
         });
@@ -2817,6 +2821,38 @@ Respond ONLY with valid JSON, no markdown fences:
     </div>
   );
 
+  /* ----- update pill: a new build is waiting; refresh on the user's terms ----- */
+  const applyUpdate = () => {
+    const w = swUpdate && (swUpdate.waiting || swUpdate.installing);
+    if (w) w.postMessage("skip-waiting"); // controllerchange listener reloads once it takes over
+    else window.location.reload();
+  };
+  const UpdatePill = () => {
+    /* hidden mid-live-session — it reappears when the workout ends */
+    if (!swUpdate || swUpdateHidden || live) return null;
+    return (
+      <div style={{
+        position: "fixed", left: "50%", transform: "translateX(-50%)",
+        bottom: "calc(64px + env(safe-area-inset-bottom))", zIndex: 40,
+        display: "flex", alignItems: "center", gap: 10, whiteSpace: "nowrap",
+        background: T.raised, border: `1px solid ${T.line}`, borderRadius: 99,
+        padding: "9px 8px 9px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.55)",
+        fontSize: 12.5, color: T.text,
+      }}>
+        <span style={{ width: 7, height: 7, borderRadius: "50%", background: T.accent, flexShrink: 0 }} />
+        New version ready
+        <button onClick={applyUpdate} style={{
+          background: T.accent, color: "#fff", border: "none", borderRadius: 99,
+          padding: "6px 13px", fontWeight: 800, fontSize: 11.5, cursor: "pointer", fontFamily: "inherit",
+        }}>Refresh</button>
+        <button onClick={() => setSwUpdateHidden(true)} title="Not now" style={{
+          background: "none", border: "none", color: T.dim, padding: "6px 6px",
+          fontWeight: 700, fontSize: 12, cursor: "pointer",
+        }}>✕</button>
+      </div>
+    );
+  };
+
   /* ----- exercise modal ----- */
   const ExModal = () => {
     if (!modal) return null;
@@ -3337,6 +3373,7 @@ Respond ONLY with valid JSON, no markdown fences:
         </div>
         </div>
         {profile && <Tabs />}
+        <UpdatePill />
       </div>
     );
   }
@@ -5062,6 +5099,7 @@ Respond ONLY with valid JSON, no markdown fences:
       </div>
       </div>
       <Tabs />
+      <UpdatePill />
       {ExModal()}
       {celebrate && (
         <div onClick={() => setCelebrate(null)} style={{

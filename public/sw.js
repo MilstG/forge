@@ -7,13 +7,15 @@
  *
  * Bump CACHE on any change here so activate() clears the old one.
  */
-const CACHE = "forge-v3";
+const CACHE = "forge-v4";
 
+/* No skipWaiting here: a freshly installed worker WAITS until the page
+   offers the "New version ready — Refresh" pill and the user taps it
+   (the "skip-waiting" message below). Auto-activating used to force a
+   reload mid-session. */
 self.addEventListener("install", (e) => {
   e.waitUntil(
-    caches.open(CACHE)
-      .then((c) => c.addAll(["/", "/index.html"]).catch(() => {}))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE).then((c) => c.addAll(["/", "/index.html"]).catch(() => {}))
   );
 });
 
