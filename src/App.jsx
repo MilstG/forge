@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { sanitizePlan } from "./lib/plan-schema.js";
+import { sanitizePlan, normalizeExercise } from "./lib/plan-schema.js";
 import { constraintBlock } from "./lib/constraints.js";
 import { applyPlanRewrite, canAutoAdjust, applyAutoAdjust } from "./lib/coach-write.js";
 import { suggestFromHistory, bumpWeight } from "./lib/progression.js";
@@ -940,7 +940,7 @@ export default function Forge() {
 
   const [d, setD] = useState({
     age: "", sex: "M", height: "", weight: "",
-    goal: GOALS[0], specific: "", level: LEVELS[0], days: 3, gear: ["barbell", "dumbbells"],
+    goal: GOALS[0], specific: "", level: LEVELS[0], days: 3, exPerDay: 0, gear: ["barbell", "dumbbells"],
     injuries: [],
     avoid: [], prefer: [], constraintNotes: "", neverSwapCompounds: false,
     photoRejects: {},
@@ -1830,13 +1830,20 @@ export default function Forge() {
   }, [loaded]);
 
   /* ---------- actions ---------- */
-  const saveProfile = () => {
-    const p = { ...d, days: +d.days || 3 };
+  /* mode "rebuild" wipes the plan and builds fresh; "align" keeps the
+     current week and asks the coach to adjust only what the new goals
+     require. Align falls back to rebuild when there is no plan yet. */
+  const saveProfile = (mode = "rebuild") => {
+    const p = { ...d, days: +d.days || 3, exPerDay: +d.exPerDay || 0 };
     setProfile(p);
     persist({ profile: p });
-    autoRan.current = false;
-    setPlan(null);
     setTab("coach");
+    if (mode === "align" && plan && Array.isArray(plan.week)) {
+      alignPlan(p);
+    } else {
+      autoRan.current = false;
+      setPlan(null);
+    }
   };
 
   const saveWorkout = () => {
@@ -1897,7 +1904,7 @@ Athlete:
 - Rep-range mismatch: their goal calls for ${goalRange} reps but only ${repRanges.pct[goalRange]}% of sets are there. Correct this.` : ""}${stale.length ? `
 - Movements they have dropped for 3+ weeks: ${stale.map((e) => e.name).join(", ")}. Reintroduce if useful.` : ""}
 
-Build a full 7-day week, Monday to Sunday, with exactly ${p.days} training days and ${7 - p.days} rest days. Place rest days sensibly for recovery. Use ONLY the available equipment. Progress loads in small steps vs their history. Serve the specific goals directly. Give every TRAINING day its own one-line warm-up that primes the specific muscles and movements in that session, AND its own one-line cool-down: 3-4 named post-workout stretches targeting exactly the muscles trained that day, with hold times, to limit next-day soreness. On rest days give a one-line recovery suggestion (walk, stretch, mobility) instead.
+Build a full 7-day week, Monday to Sunday, with exactly ${p.days} training days and ${7 - p.days} rest days. Place rest days sensibly for recovery. Use ONLY the available equipment.${+p.exPerDay ? ` The athlete asked for about ${+p.exPerDay} exercises per training day — hit that number (within one either way) on every training day, adding quality accessory work or trimming as needed.` : ""} Progress loads in small steps vs their history. Serve the specific goals directly. Give every TRAINING day its own one-line warm-up that primes the specific muscles and movements in that session, AND its own one-line cool-down: 3-4 named post-workout stretches targeting exactly the muscles trained that day, with hold times, to limit next-day soreness. On rest days give a one-line recovery suggestion (walk, stretch, mobility) instead.
 ${deloadNow ? "IMPORTANT: This must be a DELOAD week. Cut loads to roughly 60% of their recent working weights and reduce total sets by about 40%. Keep the same movement patterns, keep everything far from failure, and say in \"why\" that this is a recovery week and why it earns them progress." : ""}
 
 Respond ONLY with valid JSON, no markdown fences, no preamble:
@@ -1921,6 +1928,61 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
       const withMeta = applyPlanRewrite(plan, { ...sanitized, created: todayStr }, {
         workouts, today: todayStr,
       });
+      setPlan(withMeta);
+      persist({ plan: withMeta });
+      setOpenDay(todayIdx);
+    } catch (e) {
+      setPlanErr(String(e.message || e));
+    }
+    setPlanBusy(false);
+  };
+
+  /* Re-aim the existing week at updated goals instead of rebuilding it.
+     Logged days are still preserved by applyPlanRewrite, and created stays
+     so plan age / weekly review timing is not reset by a goal tweak. */
+  const alignPlan = async (p = profile) => {
+    if (!p || !plan || !Array.isArray(plan.week)) return;
+    setPlanBusy(true); setPlanErr("");
+    const gearLabels = p.gear.length ? p.gear.map((g) => (GEAR.find(([k]) => k === g) || [g, g])[1]) : ["Bodyweight only"];
+    const currentWeek = plan.week.map((dy) => dy.rest
+      ? { day: dy.day, rest: true, note: dy.note || "" }
+      : { day: dy.day, rest: false, focus: dy.focus, warmup: dy.warmup, cooldown: dy.cooldown, exercises: dy.exercises });
+    const prompt = `You are a personal trainer UPDATING an athlete's existing weekly program because their goals or settings changed. Do not rebuild from scratch — keep the week recognizable and change only what the new goals require.
+
+Updated athlete:
+- Age ${p.age || "?"}, sex ${p.sex}, height ${p.height || "?"} cm, weight ${p.weight || "?"} kg
+- Experience: ${p.level}. Wants to train ${p.days} days/week.
+- Main goal NOW: ${p.goal}. Specific goals in their own words: "${p.specific || "none given"}"
+- Available equipment: ${gearLabels.join(", ")}${constraintBlock(p)}
+
+Their current week:
+${JSON.stringify(currentWeek)}
+
+Rules:
+- Keep every exercise, day order and rest day that still serves the new goals. Prefer adjusting sets, reps and load guidance to the new goal over swapping movements.
+- Swap, add or remove exercises only where the new goals or equipment demand it.
+- The week must end up with exactly ${p.days} training days and ${7 - p.days} rest days; if that changed, convert the least important day(s) rather than reshuffling everything.${+p.exPerDay ? `
+- Each training day should have about ${+p.exPerDay} exercises (within one either way).` : ""}
+- Keep or minimally edit each day's warmup and cooldown lines to match that day's final muscles.
+
+Respond ONLY with valid JSON, no markdown fences, no preamble:
+{
+ "why": "2-3 sentences on what you changed and why it now serves the new goals",
+ "tip": "one specific coaching tip for this athlete right now",
+ "week": [
+  {"day":"Mon","rest":false,"focus":"short session title","warmup":"one line","cooldown":"one line: 3-4 named stretches with hold times","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short load guidance"}]},
+  For cardio, carries or holds use minutes instead of sets and reps: {"exercise":"Run","minutes":30,"load":"zone 2"}.
+  {"day":"Tue","rest":true,"note":"one-line recovery suggestion"}
+ ]
+}
+The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun in order.`;
+    try {
+      const clean = await askClaude(prompt, 2500);
+      const parsed = parseJson(clean);
+      const sanitized = sanitizePlan(parsed, { profile: p, libNames: LIB.map((e) => e.name) });
+      const withMeta = applyPlanRewrite(plan, {
+        ...sanitized, created: plan.created || todayStr, aligned: todayStr,
+      }, { workouts, today: todayStr });
       setPlan(withMeta);
       persist({ plan: withMeta });
       setOpenDay(todayIdx);
@@ -2110,6 +2172,38 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
       setPlan(np);
       persist({ plan: np });
       setSwapNote(`⇄ Swapped in ${alt.exercise}${alt.why ? " — " + alt.why : ""}`);
+      setTimeout(() => setSwapNote(""), 8000);
+    } catch (e) {
+      setSwapNote(String(e.message || e).slice(0, 160));
+      setTimeout(() => setSwapNote(""), 4000);
+    }
+    setSwapBusy(null);
+  };
+
+  /* ----- add one extra exercise to a training day (for days with more in the tank) ----- */
+  const addExercise = async (di) => {
+    if (!plan || !plan.week || !plan.week[di] || swapBusy) return;
+    const dy = plan.week[di];
+    if (dy.rest) return;
+    const key = `add-${di}`;
+    setSwapBusy(key); setSwapNote("");
+    const gearLabels = profile.gear.length ? profile.gear.map((g) => (GEAR.find(([k]) => k === g) || [g, g])[1]) : ["Bodyweight only"];
+    const prompt = `Suggest ONE exercise to ADD to an existing session — the athlete has energy for more today.
+Athlete: ${profile.level}, goal ${profile.goal}.${constraintBlock(profile)}
+Equipment available: ${gearLabels.join(", ")}.
+Session focus: ${dy.focus}. Exercises already in the session: ${dy.exercises.map((e) => e.exercise).join(", ")}.
+Add a movement that complements this session (same muscle groups or a sensible accessory/finisher), works with the equipment${(profile.injuries || []).length ? ", is safe for the injuries" : ""}, and is NOT already in the session.
+Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":3,"reps":"8-12","load":"short load guidance","why":"one short sentence on why this addition fits"}`;
+    try {
+      const clean = await askClaude(prompt, 400);
+      const extra = parseJson(clean);
+      const norm = normalizeExercise(extra, { profile, libNames: LIB.map((e) => e.name) });
+      if (!norm) throw new Error("The suggestion clashed with your limitations — try again.");
+      const np = JSON.parse(JSON.stringify(plan));
+      np.week[di].exercises.push(norm);
+      setPlan(np);
+      persist({ plan: np });
+      setSwapNote(`＋ Added ${norm.exercise}${extra.why ? " — " + extra.why : ""}`);
       setTimeout(() => setSwapNote(""), 8000);
     } catch (e) {
       setSwapNote(String(e.message || e).slice(0, 160));
@@ -2894,6 +2988,14 @@ Respond ONLY with valid JSON, no markdown fences:
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
               {[2, 3, 4, 5, 6].map((n) => <button key={n} style={S.chip(+d.days === n)} onClick={() => setDF("days", n)}>{n}</button>)}
             </div>
+            <span style={S.label}>Exercises per session</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 6 }}>
+              <button style={S.chip(!+d.exPerDay)} onClick={() => setDF("exPerDay", 0)}>Auto</button>
+              {[4, 5, 6, 7, 8].map((n) => <button key={n} style={S.chip(+d.exPerDay === n)} onClick={() => setDF("exPerDay", n)}>{n}</button>)}
+            </div>
+            <p style={{ color: T.sub, fontSize: 12.5, margin: "0 0 14px" }}>
+              Auto lets the coach size each session. Pick a number to get bigger (or shorter) days by default — you can also add one-off exercises from any day in the plan.
+            </p>
             <span style={S.label}>Gear you have — pick all that apply</span>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
               {GEAR.map(([k, label]) => (
@@ -3216,11 +3318,21 @@ Respond ONLY with valid JSON, no markdown fences:
               )}
               {nuNote && <div style={{ fontSize: 12.5, color: T.sub, marginTop: 8 }}>{nuNote}</div>}
               <p style={{ color: T.dim, fontSize: 11.5, margin: "10px 0 0" }}>
-                Everyone gets their own plans, logs, WHOOP connection and reminders. Non-admin accounts have a 3-call daily AI budget.
+                Everyone gets their own plans, logs, WHOOP connection and reminders. Non-admin accounts have a 10-call daily AI budget.
               </p>
             </div>
           )}
-          <button style={S.btn} onClick={saveProfile}>{profile ? "Save & rebuild my plan" : "Build my weekly plan →"}</button>
+          {profile && plan ? (
+            <>
+              <button style={S.btn} onClick={() => saveProfile("align")}>Save & align my current plan</button>
+              <button style={{ ...S.ghost, width: "100%", marginTop: 8 }} onClick={() => saveProfile("rebuild")}>Save & rebuild the plan from scratch</button>
+              <p style={{ color: T.dim, fontSize: 11.5, margin: "8px 2px 0", lineHeight: 1.5 }}>
+                Align keeps this week's structure and only changes what your new goals require. Rebuild throws it away and starts a fresh week.
+              </p>
+            </>
+          ) : (
+            <button style={S.btn} onClick={() => saveProfile("rebuild")}>{profile ? "Save & rebuild my plan" : "Build my weekly plan →"}</button>
+          )}
           <div style={{ height: 20 }} />
         </div>
         </div>
@@ -3473,7 +3585,7 @@ Respond ONLY with valid JSON, no markdown fences:
                 })()}
 
                 <div style={S.card}>
-                  <Rule label="The week" right={`built ${plan.created}`} />
+                  <Rule label="The week" right={plan.aligned ? `built ${plan.created} · aligned ${plan.aligned}` : `built ${plan.created}`} />
                   <div style={{ fontSize: 13.5, color: T.sub, lineHeight: 1.6 }}>{plan.why}</div>
                 </div>
 
@@ -3571,6 +3683,11 @@ Respond ONLY with valid JSON, no markdown fences:
                               </div>
                             );
                           })}
+                          <button style={{ ...S.ghost, width: "100%", marginTop: 10 }}
+                            disabled={!!swapBusy}
+                            onClick={() => addExercise(openDay)}>
+                            {swapBusy === `add-${openDay}` ? "Asking the coach…" : "＋ Add one more exercise — I've got more in the tank"}
+                          </button>
                           {swapNote && (
                             <div style={{ fontSize: 12.5, color: T.blue, padding: "9px 0 0" }}>{swapNote}</div>
                           )}
