@@ -9,6 +9,7 @@ import { canAutoAdjust, applyAutoAdjust } from "./src/lib/coach-write.js";
 import { sanitizePlan } from "./src/lib/plan-schema.js";
 import { adjustReason } from "./src/lib/whoop-signal.js";
 import { constraintBlock } from "./src/lib/constraints.js";
+import { parseJsonLoose } from "./src/lib/json.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -65,7 +66,9 @@ const writeUserJson = (id, f, data) => {
 };
 const verifyPassword = (user, pw) => {
   if (!user) return false;
-  if (!user.hash) return true; // install was never password-protected
+  // never-passworded install: only a blank password matches — anything else
+  // would make the account open to any guess once usernames are typed in
+  if (!user.hash) return String(pw || "").trim() === "";
   try {
     return crypto.timingSafeEqual(
       Buffer.from(user.hash, "hex"),
@@ -111,7 +114,7 @@ const USER_DATA_FILES = [
    The x-app-token header carries "<userId>:<password>" percent-encoded
    (HTTP headers can't hold non-ASCII). It exists for browsers that drop
    cookies in installed PWAs. */
-const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/diag", "/whoop/auth", "/auth/login", "/health"]);
+const OPEN_PATHS = new Set(["/whoop/callback", "/whoop/auth", "/auth/login", "/health"]);
 const parseCookies = (req) => {
   const out = {};
   String(req.headers.cookie || "").split(";").forEach((p) => {
@@ -125,7 +128,14 @@ const userFromToken = (raw) => {
   let sTok = String(raw);
   try { sTok = decodeURIComponent(sTok); } catch (e) {}
   const i = sTok.indexOf(":");
-  if (i <= 0) return null;
+  if (i <= 0) {
+    /* device token issued at login — replaces storing the password on-device */
+    const store = usersFile();
+    const sess = (store.sessions || []).find((x) => x.token === sTok && x.device && (!x.exp || x.exp > Date.now()));
+    return sess ? (store.users || []).find((u) => u.id === sess.userId) || null : null;
+  }
+  /* legacy "<userId>:<password>" tokens from clients that logged in before
+     device tokens existed keep working until their next login */
   const id = sTok.slice(0, i).trim();
   const pw = sTok.slice(i + 1);
   const user = (usersFile().users || []).find((u) => u.id === id);
@@ -184,24 +194,59 @@ const cookieFlags = () => {
 /* Login takes a typed username; the old user-picker endpoint is gone so
    account names are no longer enumerable before auth. userId is still
    accepted for stored tokens and older clients. */
+
+/* Brute-force throttle: 5 consecutive failures on a name locks that
+   name+IP pair for 30s. In-memory on purpose — a restart clearing it is fine. */
+const loginFails = new Map(); // "ip|name" -> { n, until }
+const LOGIN_LOCK_AFTER = 5;
+const LOGIN_LOCK_MS = 30 * 1000;
+
+/* Drop expired sessions and cap each user at their 10 newest, so one
+   user's re-logins can never evict another user's still-valid session. */
+const pruneSessions = (sessions) => {
+  const live = (sessions || []).filter((x) => x.exp > Date.now());
+  const byUser = new Map();
+  for (const s of live) {
+    if (!byUser.has(s.userId)) byUser.set(s.userId, []);
+    byUser.get(s.userId).push(s);
+  }
+  return [...byUser.values()].flatMap((l) => l.slice(-10));
+};
+
 app.post("/api/auth/login", (req, res) => {
   const userId = String((req.body && req.body.userId) || "").trim();
   const username = String((req.body && req.body.username) || "").trim();
   const pw = String((req.body && req.body.password) || "");
+  const failKey = `${req.ip}|${(username || userId).toLowerCase()}`;
+  const fails = loginFails.get(failKey);
+  if (fails && fails.until && fails.until > Date.now()) {
+    return res.status(429).json({ error: "Too many attempts — wait 30 seconds and try again." });
+  }
   const store = usersFile();
   const user = (store.users || []).find((u) =>
     userId ? u.id === userId : username && u.name.toLowerCase() === username.toLowerCase()
   );
   if (!user || !verifyPassword(user, pw)) {
+    const f = fails && (!fails.until || fails.until > Date.now() - LOGIN_LOCK_MS) ? fails : { n: 0, until: 0 };
+    f.n += 1;
+    if (f.n >= LOGIN_LOCK_AFTER) { f.until = Date.now() + LOGIN_LOCK_MS; f.n = 0; }
+    loginFails.set(failKey, f);
+    if (loginFails.size > 1000) {
+      for (const [k, v] of loginFails) if (!v.until || v.until < Date.now()) loginFails.delete(k);
+    }
     return res.status(401).json({ error: "unauthorized" });
   }
+  loginFails.delete(failKey);
   const token = crypto.randomBytes(24).toString("hex");
-  store.sessions = (store.sessions || []).filter((x) => x.exp > Date.now()).slice(-40);
+  /* deviceToken goes to localStorage on the client instead of the password */
+  const deviceToken = crypto.randomBytes(24).toString("hex");
+  store.sessions = pruneSessions(store.sessions);
   store.sessions.push({ token, userId: user.id, exp: Date.now() + 30 * 24 * 3600 * 1000, at: Date.now() });
+  store.sessions.push({ token: deviceToken, userId: user.id, exp: Date.now() + 180 * 24 * 3600 * 1000, at: Date.now(), device: true });
   user.lastLogin = Date.now();
   saveUsers(store);
   res.setHeader("Set-Cookie", `forge_session=${token}; ${cookieFlags()}`);
-  res.json({ ok: true, user: { id: user.id, name: user.name, admin: !!user.admin } });
+  res.json({ ok: true, deviceToken, user: { id: user.id, name: user.name, admin: !!user.admin } });
 });
 app.get("/api/auth/me", (req, res) => {
   res.json({ id: req.user.id, name: req.user.name, admin: !!req.user.admin, ai: aiStatus(req.user) });
@@ -547,13 +592,31 @@ const snapshotPush = (userId, reason, data) => {
 
 app.get("/api/data", (req, res) => res.json(readUserJson(req.user.id, "forge.json", {})));
 app.put("/api/data", (req, res) => {
-  const incoming = req.body || {};
+  const incoming = req.body;
+  if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
+    return res.status(400).json({ error: "body must be a JSON object" });
+  }
   const prev = readUserJson(req.user.id, "forge.json", {});
+  /* Stale-save guard: a device that queued a snapshot offline must not
+     overwrite what another device saved since. savedAt is the moment the
+     snapshot was CREATED on the client; clients without it (older builds)
+     are stamped "now" and accepted, same as before. */
+  const prevSaved = +prev.savedAt || 0;
+  const incSaved = +incoming.savedAt || Date.now();
+  if (incSaved < prevSaved) {
+    return res.status(409).json({ error: "a newer save already exists", savedAt: prevSaved });
+  }
+  incoming.savedAt = incSaved;
   const planChanged = JSON.stringify(prev.plan || null) !== JSON.stringify(incoming.plan || null);
   const deletedWorkout = (prev.workouts || []).length > (incoming.workouts || []).length;
-  if (planChanged || deletedWorkout) snapshotPush(req.user.id, planChanged ? "plan" : "workout-delete", prev);
+  /* a save that drops the whole profile is almost certainly a client bug —
+     snapshot first so undo can bring everything back */
+  const wipedProfile = !!(prev.profile && !incoming.profile);
+  if (planChanged || deletedWorkout || wipedProfile) {
+    snapshotPush(req.user.id, wipedProfile ? "profile-wipe" : planChanged ? "plan" : "workout-delete", prev);
+  }
   writeUserJson(req.user.id, "forge.json", incoming);
-  res.json({ ok: true, snapshotted: planChanged || deletedWorkout });
+  res.json({ ok: true, snapshotted: planChanged || deletedWorkout || wipedProfile });
 });
 app.get("/api/data/history", (req, res) => {
   const hist = readUserJson(req.user.id, "forge-history.json", []);
@@ -647,7 +710,12 @@ async function callAI(prompt, maxTokens = 1500) {
     throw new Error("No AI key set. Add OPENAI_API_KEY (or ANTHROPIC_API_KEY) in Railway → Variables.");
   }
   const model = await resolveModel();
-  const cap = Math.min(Math.max(maxTokens || 1500, 4000), 16000);
+  /* OpenAI reasoning models spend completion tokens on hidden reasoning
+     before any visible text, so small caps come back empty — those keep a
+     4000-token floor. Claude gets the caller's cap (it's a ceiling, not a
+     spend, but an honest cap keeps a runaway reply from costing 16k). */
+  const want = Math.min(maxTokens || 1500, 16000);
+  const cap = PROVIDER === "openai" ? Math.max(want, 4000) : Math.max(want, 400);
 
   if (PROVIDER === "openai") {
     let useModel = model, lastErr = null;
@@ -846,7 +914,7 @@ Respond ONLY with valid JSON, no markdown fences:
 {"day":"${dy.day}","rest":false,"focus":"session title","warmup":"one line warm-up for this session","exercises":[{"exercise":"name","sets":3,"reps":"8-10","load":"short guidance"}],"adjust_note":"one short sentence: what changed and why"}`;
 
     const text = await callAI(prompt, 1200);
-    const adj = JSON.parse(text.replace(/```json|```/g, "").trim());
+    const adj = parseJsonLoose(text);
     const sanitized = sanitizePlan({ why: "", tip: "", week: data.plan.week.map((d, i) => i === idx ? adj : d) }, { profile: p });
     snapshotPush(adminId, "auto-adjust", data);
     data.plan = applyAutoAdjust(data.plan, {
@@ -1035,6 +1103,9 @@ setInterval(pushCheck, 5 * 60 * 1000);
 setTimeout(pushCheck, 30 * 1000);
 
 /* ---- serve the built frontend ---- */
+/* Unknown API paths answer JSON, not the SPA's index.html — a typo'd fetch
+   should fail loudly instead of choking on "<!doctype" in JSON.parse. */
+app.use("/api", (_req, res) => res.status(404).json({ error: "unknown API endpoint" }));
 app.use(express.static(path.join(__dirname, "dist")));
 app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
 

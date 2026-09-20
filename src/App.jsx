@@ -4,6 +4,7 @@ import { constraintBlock } from "./lib/constraints.js";
 import { applyPlanRewrite, canAutoAdjust, applyAutoAdjust } from "./lib/coach-write.js";
 import { suggestFromHistory, bumpWeight } from "./lib/progression.js";
 import { adjustReason, strainBudget } from "./lib/whoop-signal.js";
+import { parseJsonLoose } from "./lib/json.js";
 
 /* ================= design tokens =================
    Direction: machinist's instrument panel. Warm near-black surfaces,
@@ -876,14 +877,9 @@ async function askClaude(prompt, maxTokens = 1500) {
   return (data.text || "").replace(/```json|```/g, "").trim();
 }
 
-// Models sometimes wrap JSON in prose; take the outermost object.
-function parseJson(text) {
-  const t = (text || "").trim();
-  try { return JSON.parse(t); } catch (e) {}
-  const a = t.indexOf("{"), b = t.lastIndexOf("}");
-  if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));
-  throw new Error("The model didn't return usable JSON.");
-}
+// Models sometimes wrap JSON in prose; the shared loose parser handles it
+// the same way here and in the server's auto-adjust scheduler.
+const parseJson = parseJsonLoose;
 
 /* ================= component ================= */
 export default function Forge() {
@@ -1086,7 +1082,9 @@ export default function Forge() {
       if (lr.status === 401) { setPwErr("Wrong username or password."); return; }
       if (!lr.ok) { setPwErr("Server error — try again in a moment."); return; }
       const who = await lr.json();
-      const combined = who.user.id + ":" + val;
+      /* the device token replaces storing the password on this device;
+         older servers without one still get the legacy id:password form */
+      const combined = who.deviceToken || (who.user.id + ":" + val);
       try { localStorage.setItem("forge-token", combined); } catch (e) {
         /* cookie session still works even if storage is blocked */
       }
@@ -1097,9 +1095,12 @@ export default function Forge() {
   };
 
   const persist = async (patch = {}) => {
-    const full = { profile, workouts, bodyLog, plan, insights, live, reviewedWeek, block, nutrition, checkins, measurements, ...patch };
+    /* savedAt marks when this snapshot was CREATED; the server refuses to
+       let an older snapshot overwrite a newer one (409) */
+    const full = { profile, workouts, bodyLog, plan, insights, live, reviewedWeek, block, nutrition, checkins, measurements, ...patch, savedAt: Date.now() };
     try {
       const r = await fetch("/api/data", { method: "PUT", headers: apiHeaders(), body: JSON.stringify(full) });
+      if (r.status === 409) return; // another device saved something newer — don't queue this one over it
       if (!r.ok) throw new Error("save failed");
       if (localStorage.getItem(PENDING_KEY)) { localStorage.removeItem(PENDING_KEY); setQueued(0); }
     } catch (e) {
@@ -1114,6 +1115,13 @@ export default function Forge() {
     if (!raw) return;
     try {
       const r = await fetch("/api/data", { method: "PUT", headers: apiHeaders(), body: raw });
+      if (r.status === 409) {
+        /* another device saved while this one was offline: the queued
+           snapshot is stale, and dropping it beats overwriting their work */
+        localStorage.removeItem(PENDING_KEY);
+        setQueued(0);
+        return;
+      }
       if (!r.ok) throw new Error("save failed");
       localStorage.removeItem(PENDING_KEY);
       setQueued(0);
@@ -3354,7 +3362,10 @@ Respond ONLY with valid JSON, no markdown fences:
               )}
               {nuNote && <div style={{ fontSize: 12.5, color: T.sub, marginTop: 8 }}>{nuNote}</div>}
               <p style={{ color: T.dim, fontSize: 11.5, margin: "10px 0 0" }}>
-                Everyone gets their own plans, logs, WHOOP connection and reminders. Non-admin accounts have a 10-call daily AI budget.
+                Everyone gets their own plans, logs, WHOOP connection and reminders. Non-admin accounts have a daily AI budget{(() => {
+                  const row = (adminUsers || []).find((u) => !u.admin && u.aiLimit != null);
+                  return row ? ` (${row.aiLimit} calls)` : "";
+                })()}.
               </p>
             </div>
           )}

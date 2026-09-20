@@ -7,7 +7,11 @@
  *
  * Bump CACHE on any change here so activate() clears the old one.
  */
-const CACHE = "forge-v4";
+const CACHE = "forge-v5";
+/* Exercise photos live in their own capped cache so they can be trimmed
+   without ever touching the app shell. */
+const PHOTO_CACHE = "forge-photos-v1";
+const PHOTO_MAX = 200;
 
 /* No skipWaiting here: a freshly installed worker WAITS until the page
    offers the "New version ready — Refresh" pill and the user taps it
@@ -22,7 +26,7 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && k !== PHOTO_CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -107,13 +111,20 @@ self.addEventListener("fetch", (e) => {
     return;
   }
 
-  /* Exercise photos: cache first so they survive a dead signal. */
+  /* Exercise photos: cache first so they survive a dead signal. Capped so
+     browsing the whole library can't grow storage forever. */
   e.respondWith(
     caches.match(req).then((hit) =>
       hit || fetch(req).then((res) => {
         if (res && res.status === 200) {
           const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(req, copy));
+          caches.open(PHOTO_CACHE).then(async (c) => {
+            await c.put(req, copy);
+            const keys = await c.keys();
+            if (keys.length > PHOTO_MAX) {
+              await Promise.all(keys.slice(0, keys.length - PHOTO_MAX).map((k) => c.delete(k)));
+            }
+          });
         }
         return res;
       }).catch(() => hit)

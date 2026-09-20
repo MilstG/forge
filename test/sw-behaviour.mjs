@@ -15,6 +15,8 @@ const mkCache = (name) => {
       const k = typeof req === "string" ? req : req.url;
       return m.has(k) ? { body: m.get(k), clone() { return this; } } : undefined;
     },
+    keys: async () => [...m.keys()].map((u) => ({ url: u })),
+    delete: async (req) => m.delete(typeof req === "string" ? req : req.url),
   };
 };
 
@@ -62,9 +64,12 @@ const doFetch = async (r) => {
   return out === undefined ? "PASSTHROUGH(network)" : (await out).body;
 };
 
-const t = (label, got, want) =>
+let fails = 0;
+const t = (label, got, want) => {
+  if (got !== want) fails++;
   console.log((got === want ? "PASS  " : "FAIL  ") + label + "\n        got " + JSON.stringify(got) +
     (got === want ? "" : "  WANTED " + JSON.stringify(want)));
+};
 
 // --- deploy v1, load the page ---
 server = { "https://forge.app/index.html": "HTML-v1", "https://forge.app/assets/app-aaa.js": "JS-v1" };
@@ -91,3 +96,15 @@ server["https://raw.githubusercontent.com/x/0.jpg"] = "IMG";
 await doFetch(req("https://raw.githubusercontent.com/x/0.jpg"));
 network = false;
 t("exercise photo survives offline", await doFetch(req("https://raw.githubusercontent.com/x/0.jpg")), "IMG");
+
+// --- photo cache stays capped ---
+network = true;
+for (let i = 1; i <= 210; i++) {
+  server[`https://raw.githubusercontent.com/x/${i}.jpg`] = "IMG" + i;
+  await doFetch(req(`https://raw.githubusercontent.com/x/${i}.jpg`));
+}
+await new Promise((r) => setTimeout(r, 20)); // let the async trim settle
+const photoCount = caches_.has("forge-photos-v1") ? caches_.get("forge-photos-v1").size : 0;
+t("photo cache trimmed to the cap", photoCount <= 200, true);
+
+process.exitCode = fails ? 1 : 0;

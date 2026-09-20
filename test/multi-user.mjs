@@ -83,6 +83,24 @@ r = await call("POST", "/api/auth/login", { body: { username: "nobody", password
 ok(r.status === 401, "unknown username rejected");
 r = await call("POST", "/api/auth/login", { body: { username: "milst", password: "oldpw" }, as: "admin" });
 ok(r.status === 200 && r.json.user.admin, "username login (case-insensitive) works; auth.json override password wins over APP_PASSWORD");
+const adminDeviceToken = r.json.deviceToken;
+ok(typeof adminDeviceToken === "string" && adminDeviceToken.length >= 32, "login issues a device token");
+r = await call("GET", "/api/auth/me", { token: adminDeviceToken });
+ok(r.status === 200 && r.json.admin, "device token authenticates without the password");
+r = await call("GET", "/api/whoop/diag");
+ok(r.status === 401, "whoop diagnostics now require auth");
+r = await call("GET", "/api/definitely-not-a-route", { as: "admin" });
+ok(r.status === 404 && r.json && /unknown/i.test(r.json.error), "unknown API path returns JSON 404, not the SPA");
+
+console.log("login throttle");
+for (let i = 1; i <= 5; i++) {
+  r = await call("POST", "/api/auth/login", { body: { username: "ghost", password: "nope" } });
+  ok(r.status === 401, `bad attempt ${i} rejected with 401`);
+}
+r = await call("POST", "/api/auth/login", { body: { username: "ghost", password: "nope" } });
+ok(r.status === 429, "6th attempt is throttled with 429");
+r = await call("POST", "/api/auth/login", { body: { username: "milst", password: "oldpw" } });
+ok(r.status === 200, "throttle is per-username — other accounts unaffected");
 r = await call("GET", "/api/data", { as: "admin" });
 ok(r.status === 200 && r.json.profile && r.json.profile.goal === "strength", "admin sees the migrated data");
 r = await call("GET", "/api/data", { token: admin.id + ":oldpw" });
@@ -121,6 +139,22 @@ await call("PUT", "/api/exinfo", { as: "admin", body: { squat: "a" } });
 await call("PUT", "/api/exinfo", { as: "juan", body: { bench: "b" } });
 r = await call("GET", "/api/exinfo", { as: "admin" });
 ok(r.json.squat === "a" && r.json.bench === "b", "shared exinfo merges instead of overwriting");
+
+console.log("save guards");
+r = await call("PUT", "/api/data", { as: "juan", body: { profile: { goal: "hypertrophy" }, workouts: [], savedAt: 12345 } });
+ok(r.status === 409, "a snapshot older than the stored save is refused (stale offline queue)");
+r = await call("GET", "/api/data", { as: "juan" });
+ok(r.json.profile.goal === "hypertrophy", "stored data untouched by the stale snapshot");
+r = await call("PUT", "/api/data", { as: "juan", body: { workouts: [], savedAt: Date.now() } });
+ok(r.status === 200 && r.json.snapshotted === true, "a save that drops the profile is snapshotted first");
+r = await call("GET", "/api/data/history", { as: "juan" });
+ok(r.json.some((h) => h.reason === "profile-wipe"), "the wipe snapshot is in the undo history");
+r = await call("POST", "/api/data/undo", { as: "juan" });
+ok(r.status === 200, "undo restores the pre-wipe data");
+r = await call("GET", "/api/data", { as: "juan" });
+ok(r.json.profile && r.json.profile.goal === "hypertrophy", "profile is back after undo");
+r = await call("PUT", "/api/data", { as: "juan", body: "not an object" });
+ok(r.status === 400, "non-object body rejected");
 
 console.log("AI rate limit");
 const LIMIT = 10;
