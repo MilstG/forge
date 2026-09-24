@@ -937,6 +937,8 @@ export default function Forge() {
   const [aiQuota, setAiQuota] = useState(null);
   const [loginName, setLoginName] = useState("");
   const [adminUsers, setAdminUsers] = useState(null);
+  const [adminActivity, setAdminActivity] = useState(null);
+  const [actOpen, setActOpen] = useState(null);
   const [nuName, setNuName] = useState("");
   const [nuPw, setNuPw] = useState("");
   const [nuNote, setNuNote] = useState("");
@@ -1044,6 +1046,16 @@ export default function Forge() {
       } catch (e) {}
     })();
   }, [me, tab, adminUsers]);
+  /* admin: usage overview loads alongside it */
+  useEffect(() => {
+    if (!me || !me.admin || tab !== "profile" || adminActivity) return;
+    (async () => {
+      try {
+        const r = await fetch("/api/admin/activity", { headers: apiHeaders() });
+        if (r.ok) setAdminActivity(await r.json());
+      } catch (e) {}
+    })();
+  }, [me, tab, adminActivity]);
 
   /* WHOOP: re-fetch whenever the app comes back to the foreground and every
      15 min while visible. A PWA left open overnight otherwise keeps showing
@@ -3473,6 +3485,73 @@ Respond ONLY with valid JSON, no markdown fences:
                   const row = (adminUsers || []).find((u) => !u.admin && u.aiLimit != null);
                   return row ? ` (${row.aiLimit} calls)` : "";
                 })()}.
+              </p>
+            </div>
+          )}
+          {profile && me && me.admin && (
+            <div style={S.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <Rule label="Usage" />
+                <span onClick={() => { setAdminActivity(null); setActOpen(null); }}
+                  style={{ fontSize: 12, color: T.blue, cursor: "pointer", fontWeight: 700 }}>↻ refresh</span>
+              </div>
+              {!adminActivity && <p style={{ color: T.dim, fontSize: 12.5, margin: 0 }}>Loading…</p>}
+              {adminActivity && adminActivity.map((u) => {
+                const open = actOpen === u.id;
+                const lastLoginDay = u.lastLogin ? new Date(u.lastLogin).toISOString().slice(0, 10) : null;
+                return (
+                  <div key={u.id} style={{ borderBottom: `1px solid ${T.line}`, padding: "10px 0" }}>
+                    <div onClick={() => setActOpen(open ? null : u.id)} style={{ cursor: "pointer" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+                        <span style={{ fontSize: 13.5, fontWeight: 700 }}>{u.name}{u.admin ? " · you" : ""}</span>
+                        <span style={{ fontSize: 11.5, color: u.lastWorkout ? T.sub : T.dim }}>
+                          {u.lastWorkout ? `last trained ${u.lastWorkout}` : u.hasProfile ? "no sessions logged" : "never set up"}
+                        </span>
+                      </div>
+                      <div style={{ ...mono, fontSize: 11.5, color: T.sub, marginTop: 3 }}>
+                        {u.workouts7} this wk · {u.workouts28} in 28d
+                        {u.volume28 ? ` · ${u.volume28.toLocaleString()} vol` : ""}
+                        {u.aiLimit != null ? ` · AI ${u.aiToday}/${u.aiLimit}` : ""}
+                        <span style={{ color: T.dim }}> {open ? "▴" : "▾"}</span>
+                      </div>
+                    </div>
+                    {open && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ fontSize: 12, color: T.sub, lineHeight: 1.7 }}>
+                          {u.hasProfile
+                            ? <>Goal: <b style={{ color: T.text }}>{u.goal}</b> · {u.daysPerWeek} days/wk</>
+                            : "Hasn't finished onboarding."}
+                          {u.planCreated ? <> · plan built {u.planCreated}{u.planAligned ? ` (aligned ${u.planAligned})` : ""}</> : null}
+                          <br />
+                          {u.checkins28} check-ins in 28d · {u.bodyLogCount} weigh-ins
+                          {u.whoop ? " · WHOOP ✓" : ""}
+                          {u.pushDevices ? ` · reminders on ${u.pushDevices} device${u.pushDevices === 1 ? "" : "s"}` : ""}
+                          {lastLoginDay ? ` · last login ${lastLoginDay}` : " · never logged in"}
+                        </div>
+                        {u.recent.length > 0 && (
+                          <div style={{ marginTop: 8 }}>
+                            <span style={S.label}>Recent sessions</span>
+                            {u.recent.map((w, i) => (
+                              <div key={i} style={{ background: T.surface2, borderRadius: 9, padding: "8px 11px", marginBottom: 6 }}>
+                                <div style={{ ...mono, fontSize: 11, color: T.dim, marginBottom: 3 }}>{w.date}</div>
+                                {w.exercises.map((e, j) => (
+                                  <div key={j} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12.5, padding: "2px 0" }}>
+                                    <span>{e.name}</span>
+                                    <span style={{ color: T.sub, whiteSpace: "nowrap" }}>{exSummary({ ...e, mode: e.mins || e.km ? "time" : "reps" })}</span>
+                                  </div>
+                                ))}
+                                {w.notes && <div style={{ fontSize: 11.5, color: T.sub, fontStyle: "italic", marginTop: 3 }}>“{w.notes}”</div>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <p style={{ color: T.dim, fontSize: 11.5, margin: "10px 0 0" }}>
+                Tap a user to see their setup and recent sessions.
               </p>
             </div>
           )}

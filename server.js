@@ -314,6 +314,55 @@ app.post("/api/users/:id/ai-limit", requireAdmin, (req, res) => {
   saveUsers(store);
   res.json({ ok: true, aiLimit: aiLimitFor(user) });
 });
+/* Usage overview: is each account actually training, and how. Summaries
+   plus their recent sessions, for the admin's Usage panel. */
+app.get("/api/admin/activity", requireAdmin, (req, res) => {
+  const today = dateInTz();
+  const daysAgo = (n) => {
+    const d = new Date(today + "T00:00:00");
+    d.setDate(d.getDate() - n);
+    return d.toISOString().slice(0, 10);
+  };
+  const d7 = daysAgo(7), d28 = daysAgo(28);
+  const volumeOf = (w) => (w.exercises || []).reduce((s, e) => {
+    if (e.mins || e.km) return s;
+    return s + (+e.sets || 0) * (+e.reps || 0) * (+e.weight || 0);
+  }, 0);
+  res.json((usersFile().users || []).map((u) => {
+    const data = readUserJson(u.id, "forge.json", {}) || {};
+    const ws = Array.isArray(data.workouts) ? data.workouts : [];
+    const w28 = ws.filter((w) => w && w.date >= d28);
+    const lastWorkout = ws.reduce((m, w) => (w && w.date > m ? w.date : m), "") || null;
+    return {
+      id: u.id, name: u.name, admin: !!u.admin,
+      lastLogin: u.lastLogin || null,
+      whoop: !!((readUserJson(u.id, "whoop.json", null) || {}).access_token),
+      pushDevices: pushSubs(u.id).length,
+      aiToday: u.admin ? null : aiUsage(u.id, aiLimitFor(u)).count,
+      aiLimit: u.admin ? null : aiLimitFor(u),
+      hasProfile: !!data.profile,
+      goal: (data.profile && data.profile.goal) || null,
+      daysPerWeek: (data.profile && data.profile.days) || null,
+      planCreated: (data.plan && data.plan.created) || null,
+      planAligned: (data.plan && data.plan.aligned) || null,
+      workoutsTotal: ws.length,
+      workouts7: ws.filter((w) => w && w.date >= d7).length,
+      workouts28: w28.length,
+      volume28: Math.round(w28.reduce((s, w) => s + volumeOf(w), 0)),
+      lastWorkout,
+      checkins28: (data.checkins || []).filter((c) => c && c.date >= d28).length,
+      bodyLogCount: (data.bodyLog || []).length,
+      recent: ws.slice(0, 8).map((w) => ({
+        date: w.date,
+        notes: w.notes || "",
+        exercises: (w.exercises || []).map((e) => ({
+          name: e.name, sets: e.sets, reps: e.reps, weight: e.weight,
+          mins: e.mins || "", km: e.km || "", rpe: e.rpe || "",
+        })),
+      })),
+    };
+  }));
+});
 app.post("/api/users", requireAdmin, (req, res) => {
   const name = String((req.body && req.body.name) || "").trim().slice(0, 24);
   const password = String((req.body && req.body.password) || "").trim();
