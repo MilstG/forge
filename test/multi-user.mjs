@@ -240,6 +240,26 @@ const adminRow = await call("GET", "/api/users", { as: "admin" });
 r = await call("POST", `/api/users/${adminRow.json.find((u) => u.admin).id}/ai-limit`, { as: "admin", body: { limit: 5 } });
 ok(r.status === 400, "cannot put a limit on the admin");
 
+console.log("admin usage overview");
+await call("PUT", "/api/data", {
+  as: "rafa",
+  body: {
+    profile: { goal: "strength", days: 3 },
+    workouts: [{ id: 1, date: "2099-01-02", exercises: [{ name: "Bench Press", sets: "3", reps: "8", weight: "60" }], notes: "felt good" }],
+    savedAt: Date.now(),
+  },
+});
+r = await call("GET", "/api/admin/activity", { as: "rafa" });
+ok(r.status === 403, "usage overview is admin-only");
+r = await call("GET", "/api/admin/activity", { as: "admin" });
+ok(r.status === 200 && Array.isArray(r.json), "admin gets the overview");
+const rafaAct = r.json.find((u) => u.id === rafaId);
+ok(rafaAct && rafaAct.workoutsTotal === 1 && rafaAct.lastWorkout === "2099-01-02", "rafa's session count and last workout are right");
+ok(rafaAct.recent.length === 1 && rafaAct.recent[0].exercises[0].name === "Bench Press"
+  && rafaAct.recent[0].notes === "felt good", "recent sessions carry exercises and notes");
+ok(rafaAct.hasProfile === true && rafaAct.goal === "strength", "profile summary included");
+ok(typeof rafaAct.aiToday === "number" && rafaAct.aiLimit === 10, "AI usage rides along");
+
 console.log("second boot is a no-op");
 const before = JSON.stringify(JSON.parse(fs.readFileSync(path.join(DATA, "users.json"), "utf8")).users.map((u) => u.id));
 /* simulate what migrateSingleUser checks: users already exist */
