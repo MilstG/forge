@@ -908,6 +908,11 @@ export default function Forge() {
   });
   const [swapBusy, setSwapBusy] = useState(null);
   const [swapNote, setSwapNote] = useState("");
+  const [syncConflict, setSyncConflict] = useState(false);
+  const [unlockBusy, setUnlockBusy] = useState(false);
+  const [libAddDay, setLibAddDay] = useState(null);
+  const [libAddName, setLibAddName] = useState("");
+  const [editingId, setEditingId] = useState(null);
   const [moveDay, setMoveDay] = useState(null);
   const [addInj, setAddInj] = useState("");
   const [addAvoid, setAddAvoid] = useState("");
@@ -938,7 +943,7 @@ export default function Forge() {
 
   const [d, setD] = useState({
     age: "", sex: "M", height: "", weight: "",
-    goal: GOALS[0], specific: "", level: LEVELS[0], days: 3, exPerDay: 0, gear: ["barbell", "dumbbells"],
+    goal: GOALS[0], specific: "", level: LEVELS[0], days: 3, exPerDay: 0, restSecs: 0, gear: ["barbell", "dumbbells"],
     injuries: [],
     avoid: [], prefer: [], constraintNotes: "", neverSwapCompounds: false,
     photoRejects: {},
@@ -1069,10 +1074,12 @@ export default function Forge() {
   }, []);
 
   const unlock = async () => {
+    if (unlockBusy) return;
     const val = pw.trim();
     const name = loginName.trim();
     if (!name) { setPwErr("Type your username first."); return; }
     setPwErr("");
+    setUnlockBusy(true);
     try {
       const lr = await fetch("/api/auth/login", {
         method: "POST",
@@ -1091,6 +1098,8 @@ export default function Forge() {
       window.location.reload();
     } catch (e) {
       setPwErr("Couldn't reach the server. Check your connection.");
+    } finally {
+      setUnlockBusy(false);
     }
   };
 
@@ -1100,7 +1109,7 @@ export default function Forge() {
     const full = { profile, workouts, bodyLog, plan, insights, live, reviewedWeek, block, nutrition, checkins, measurements, ...patch, savedAt: Date.now() };
     try {
       const r = await fetch("/api/data", { method: "PUT", headers: apiHeaders(), body: JSON.stringify(full) });
-      if (r.status === 409) return; // another device saved something newer — don't queue this one over it
+      if (r.status === 409) { setSyncConflict(true); return; } // another device saved something newer — don't queue this one over it
       if (!r.ok) throw new Error("save failed");
       if (localStorage.getItem(PENDING_KEY)) { localStorage.removeItem(PENDING_KEY); setQueued(0); }
     } catch (e) {
@@ -1120,6 +1129,7 @@ export default function Forge() {
            snapshot is stale, and dropping it beats overwriting their work */
         localStorage.removeItem(PENDING_KEY);
         setQueued(0);
+        setSyncConflict(true);
         return;
       }
       if (!r.ok) throw new Error("save failed");
@@ -1665,7 +1675,11 @@ export default function Forge() {
   };
 
   /* ----- rest timer duration by goal ----- */
-  const restSecs = ({ "Build strength": 180, "Build muscle": 90, "Lose fat": 60, "Endurance": 60, "General fitness": 90 })[profile && profile.goal] || 90;
+  /* rest length: per-user override from settings, else sensible for the goal */
+  const goalRestSecs = ({ "Build strength": 180, "Build muscle": 90, "Lose fat": 60, "Endurance": 60, "General fitness": 90 })[profile && profile.goal] || 90;
+  const restSecs = (profile && +profile.restSecs) || goalRestSecs;
+  /* daily AI budget exhausted — used to gray out buttons that would 429 */
+  const aiOut = !!(me && !me.admin && aiQuota && aiQuota.left === 0);
   const fmtClock = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
   /* ----- adherence ----- */
@@ -1734,6 +1748,23 @@ export default function Forge() {
       if (kg < ww && !out.some((o) => o.kg === kg)) out.push({ kg, reps });
     });
     return out.length ? out : null;
+  };
+
+  /* ----- plate math: what goes on each side of a 20kg bar ----- */
+  const isBarbellName = (name) => {
+    const n = String(name || "").toLowerCase();
+    if (/dumbbell|kettlebell|machine|cable|smith|goblet|band|bodyweight|leg press/.test(n)) return false;
+    return /barbell|deadlift|\bsquat\b|bench press|overhead press|military press|\brow\b|romanian|hip thrust|push press/.test(n);
+  };
+  const plateMath = (total, barKg = 20) => {
+    const t = parseFloat(total);
+    if (!(t > barKg)) return null;
+    let side = (t - barKg) / 2;
+    const plates = [];
+    for (const p of [25, 20, 15, 10, 5, 2.5, 1.25]) {
+      while (side >= p - 1e-9) { plates.push(p); side -= p; }
+    }
+    return { plates, leftover: Math.round(side * 2 * 100) / 100 };
   };
 
   /* ----- nutrition targets (Mifflin-St Jeor) ----- */
@@ -1846,7 +1877,7 @@ export default function Forge() {
      current week and asks the coach to adjust only what the new goals
      require. Align falls back to rebuild when there is no plan yet. */
   const saveProfile = (mode = "rebuild") => {
-    const p = { ...d, days: +d.days || 3, exPerDay: +d.exPerDay || 0 };
+    const p = { ...d, days: +d.days || 3, exPerDay: +d.exPerDay || 0, restSecs: +d.restSecs || 0 };
     setProfile(p);
     persist({ profile: p });
     setTab("coach");
@@ -1859,7 +1890,10 @@ export default function Forge() {
   };
 
   const saveWorkout = () => {
-    const clean = exs.filter((e) => e.name.trim()).map((e) => ({ ...e, name: canonicalName(e.name) }));
+    const clean = exs.filter((e) => e.name.trim()).map((e) => {
+      const { repHint, ...rest } = e; // form-only hint, never stored
+      return { ...rest, name: canonicalName(e.name) };
+    });
     if (!clean.length) { setFlash("Add at least one exercise"); setTimeout(() => setFlash(""), 1800); return; }
     const newPRs = clean
       .filter((e) => {
@@ -1867,18 +1901,20 @@ export default function Forge() {
         return wt > 0 && wt > ((prs[k] || {}).weight || 0);
       })
       .map((e) => ({ name: e.name.trim(), weight: +e.weight, old: (prs[e.name.trim().toLowerCase()] || {}).weight || null }));
-    const w = { id: Date.now(), date, exercises: clean, notes: notes.trim() };
-    const next = [w, ...workouts].sort((a, b) => (a.date < b.date ? 1 : -1));
+    const w = { id: editingId || Date.now(), date, exercises: clean, notes: notes.trim() };
+    const next = [w, ...workouts.filter((x) => x.id !== editingId)].sort((a, b) => (a.date < b.date ? 1 : -1));
     setWorkouts(next); persist({ workouts: next });
     setExs([emptyEx()]); setNotes("");
-    if (newPRs.length) setCelebrate(newPRs);
-    setFlash("Saved — +" + (50 + clean.length * 10) + " XP");
+    if (newPRs.length && !editingId) setCelebrate(newPRs);
+    setFlash(editingId ? "Session updated" : "Saved — +" + (50 + clean.length * 10) + " XP");
+    setEditingId(null);
     setTimeout(() => setFlash(""), 2200);
   };
 
   const delWorkout = (id) => {
     const next = workouts.filter((w) => w.id !== id);
     setWorkouts(next); persist({ workouts: next });
+    if (editingId === id) { setEditingId(null); setExs([emptyEx()]); setNotes(""); }
   };
 
   const logBodyWeight = () => {
@@ -2020,9 +2056,26 @@ The "week" array must have exactly 7 entries, days Mon,Tue,Wed,Thu,Fri,Sat,Sun i
         : {
           ...emptyEx(), name: e.exercise, mode: "reps",
           sets: String(e.sets || ""), reps: String(e.reps || "").split("-")[0], weight: "",
+          repHint: String(e.reps || ""), // full target range, shown under the row
         }
     )));
+    setEditingId(null);
     setDate(todayStr);
+    setTab("log");
+  };
+
+  /* load a logged session back into the form; saving replaces it in place */
+  const editWorkout = (w) => {
+    setExs(w.exercises.map((e) => ({
+      ...emptyEx(),
+      name: e.name || "",
+      mode: e.mode || (e.mins ? "time" : "reps"),
+      sets: String(e.sets ?? ""), reps: String(e.reps ?? ""), weight: String(e.weight ?? ""),
+      rpe: String(e.rpe ?? ""), mins: String(e.mins ?? ""), km: String(e.km ?? ""),
+    })));
+    setDate(w.date);
+    setNotes(w.notes || "");
+    setEditingId(w.id);
     setTab("log");
   };
 
@@ -2186,8 +2239,8 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":${+c
       setSwapNote(`⇄ Swapped in ${alt.exercise}${alt.why ? " — " + alt.why : ""}`);
       setTimeout(() => setSwapNote(""), 8000);
     } catch (e) {
-      setSwapNote(String(e.message || e).slice(0, 160));
-      setTimeout(() => setSwapNote(""), 4000);
+      setSwapNote("⚠ " + String(e.message || e).slice(0, 160));
+      setTimeout(() => setSwapNote(""), 6000);
     }
     setSwapBusy(null);
   };
@@ -2218,10 +2271,36 @@ Respond ONLY with valid JSON, no markdown fences: {"exercise":"name","sets":3,"r
       setSwapNote(`＋ Added ${norm.exercise}${extra.why ? " — " + extra.why : ""}`);
       setTimeout(() => setSwapNote(""), 8000);
     } catch (e) {
-      setSwapNote(String(e.message || e).slice(0, 160));
-      setTimeout(() => setSwapNote(""), 4000);
+      setSwapNote("⚠ " + String(e.message || e).slice(0, 160));
+      setTimeout(() => setSwapNote(""), 6000);
     }
     setSwapBusy(null);
+  };
+
+  /* ----- add an exercise from the built-in library (no AI call) ----- */
+  const addFromLibrary = () => {
+    const name = canonicalName(libAddName.trim());
+    if (!name || libAddDay == null || !plan || !plan.week || !plan.week[libAddDay]) return;
+    const dy = plan.week[libAddDay];
+    if (dy.rest) return;
+    if ((dy.exercises || []).some((e) => e.exercise.toLowerCase() === name.toLowerCase())) {
+      setSwapNote(`⚠ ${name} is already in this session.`);
+      setTimeout(() => setSwapNote(""), 4000);
+      return;
+    }
+    const norm = normalizeExercise({ exercise: name, sets: 3, reps: "8-10" }, { profile, libNames: LIB.map((e) => e.name) });
+    if (!norm) {
+      setSwapNote("⚠ That clashes with your injuries or banned lifts.");
+      setTimeout(() => setSwapNote(""), 5000);
+      return;
+    }
+    const np = JSON.parse(JSON.stringify(plan));
+    np.week[libAddDay].exercises.push(norm);
+    setPlan(np);
+    persist({ plan: np });
+    setLibAddName("");
+    setSwapNote(`＋ Added ${norm.exercise}`);
+    setTimeout(() => setSwapNote(""), 5000);
   };
 
   /* ----- move a session to another day (swap contents, keep day labels) ----- */
@@ -2963,11 +3042,13 @@ Respond ONLY with valid JSON, no markdown fences:
               onKeyDown={(e) => e.key === "Enter" && unlock()}
               style={{ ...S.input, marginBottom: 12 }} />
             <span style={S.label}>Password</span>
-            <input type="password" value={pw}
+            <input type="password" value={pw} autoComplete="current-password"
               onChange={(e) => setPw(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && unlock()}
               style={{ ...S.input, marginBottom: 12 }} />
-            <button style={S.btn} onClick={unlock}>Unlock</button>
+            <button style={{ ...S.btn, opacity: unlockBusy ? 0.6 : 1 }} disabled={unlockBusy} onClick={unlock}>
+              {unlockBusy ? "Unlocking…" : "Unlock"}
+            </button>
             {pwErr && (
               <div style={{
                 marginTop: 12, fontSize: 12.5, lineHeight: 1.5, color: T.red,
@@ -3039,6 +3120,16 @@ Respond ONLY with valid JSON, no markdown fences:
             </div>
             <p style={{ color: T.sub, fontSize: 12.5, margin: "0 0 14px" }}>
               Auto lets the coach size each session. Pick a number to get bigger (or shorter) days by default — you can also add one-off exercises from any day in the plan.
+            </p>
+            <span style={S.label}>Rest timer between sets</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 6 }}>
+              <button style={S.chip(!+d.restSecs)} onClick={() => setDF("restSecs", 0)}>Auto</button>
+              {[60, 90, 120, 180, 240].map((n) => (
+                <button key={n} style={S.chip(+d.restSecs === n)} onClick={() => setDF("restSecs", n)}>{n}s</button>
+              ))}
+            </div>
+            <p style={{ color: T.sub, fontSize: 12.5, margin: "0 0 14px" }}>
+              Auto matches your goal ({({ "Build strength": 180, "Build muscle": 90, "Lose fat": 60, "Endurance": 60, "General fitness": 90 })[d.goal] || 90}s for {d.goal || "your goal"}). The +30s button in a live session still works either way.
             </p>
             <span style={S.label}>Gear you have — pick all that apply</span>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -3263,9 +3354,9 @@ Respond ONLY with valid JSON, no markdown fences:
             <div style={S.card}>
               <Rule label="Password" />
               <span style={S.label}>Current</span>
-              <input type="password" style={{ ...S.input, marginBottom: 8 }} value={pwCur} onChange={(e) => setPwCur(e.target.value)} />
+              <input type="password" autoComplete="current-password" style={{ ...S.input, marginBottom: 8 }} value={pwCur} onChange={(e) => setPwCur(e.target.value)} />
               <span style={S.label}>New password</span>
-              <input type="password" style={{ ...S.input, marginBottom: 10 }} value={pwNext} onChange={(e) => setPwNext(e.target.value)} />
+              <input type="password" autoComplete="new-password" style={{ ...S.input, marginBottom: 10 }} value={pwNext} onChange={(e) => setPwNext(e.target.value)} />
               <button style={S.ghost} onClick={async () => {
                 setPwNote("");
                 try {
@@ -3275,7 +3366,8 @@ Respond ONLY with valid JSON, no markdown fences:
                   });
                   const j = await r.json();
                   if (!r.ok) { setPwNote(j.error || "Could not change password"); return; }
-                  const combined = (me ? me.id : "") + ":" + pwNext;
+                  /* fresh device token, so the new password never lands in localStorage */
+                  const combined = j.deviceToken || ((me ? me.id : "") + ":" + pwNext);
                   try { localStorage.setItem("forge-token", combined); } catch (e) {}
                   APP_TOKEN = combined;
                   setPwNote("Password updated. You'll need it next time you unlock.");
@@ -3322,6 +3414,21 @@ Respond ONLY with valid JSON, no markdown fences:
                           setNuNote(r.ok ? `${u.name}'s password was reset.` : (j.error || "Reset failed"));
                         } catch (e) { setNuNote("Network error"); }
                       }}>Reset pw</button>
+                      <button style={{ ...S.ghost, padding: "5px 9px", fontSize: 12 }} onClick={async () => {
+                        const raw = window.prompt(`Daily AI calls for ${u.name} (1-100, empty = default):`, u.aiLimit || "");
+                        if (raw === null) return;
+                        try {
+                          const r = await fetch(`/api/users/${u.id}/ai-limit`, {
+                            method: "POST", headers: apiHeaders(),
+                            body: JSON.stringify({ limit: raw.trim() === "" ? null : +raw }),
+                          });
+                          const j = await r.json();
+                          if (!r.ok) { setNuNote(j.error || "Could not set the limit"); return; }
+                          setNuNote(`${u.name}'s daily AI limit is now ${j.aiLimit}.`);
+                          const lr = await fetch("/api/users", { headers: apiHeaders() });
+                          if (lr.ok) setAdminUsers(await lr.json());
+                        } catch (e) { setNuNote("Network error"); }
+                      }}>AI limit</button>
                       <button style={{ ...S.ghost, padding: "5px 9px", fontSize: 12, color: T.red }} onClick={async () => {
                         if (!window.confirm(`Remove ${u.name}? Their login stops working. Their data is parked on the server, not deleted.`)) return;
                         try {
@@ -3392,7 +3499,18 @@ Respond ONLY with valid JSON, no markdown fences:
   return (
     <div style={S.page}>
       <Header />
-      {(!online || queued > 0) && (
+      {syncConflict && (
+        <div style={{
+          background: T.redDim, borderBottom: `1px solid ${T.line}`,
+          padding: "7px 14px", fontSize: 12.5, color: T.red, textAlign: "center",
+        }}>
+          Not saved — another device has newer data.{" "}
+          <span onClick={() => window.location.reload()} style={{ textDecoration: "underline", cursor: "pointer", fontWeight: 700 }}>
+            Reload to sync
+          </span>
+        </div>
+      )}
+      {!syncConflict && (!online || queued > 0) && (
         <div style={{
           background: online ? T.goldDim : T.redDim, borderBottom: `1px solid ${T.line}`,
           padding: "7px 14px", fontSize: 12.5, color: online ? T.gold : T.red, textAlign: "center",
@@ -3404,6 +3522,9 @@ Respond ONLY with valid JSON, no markdown fences:
       )}
       <div style={S.scroll}>
       <div style={S.shell}>
+        {/* one shared exercise-name datalist: the log form and the plan's
+            library-add both reference it */}
+        <datalist id="lib">{LIB.map((e) => <option key={e.name} value={e.name} />)}</datalist>
 
         {/* ================= PLAN ================= */}
         {tab === "coach" && (
@@ -3717,9 +3838,11 @@ Respond ONLY with valid JSON, no markdown fences:
                                   )}
                                 </div>
                                 <button onClick={(ev) => { ev.stopPropagation(); swapExercise(openDay, i); }}
-                                  title="Swap for an alternative" style={{
-                                    background: T.surface2, border: `1px solid ${T.line}`, color: T.blue,
-                                    borderRadius: 8, width: 34, height: 34, cursor: "pointer", fontSize: 16, flexShrink: 0,
+                                  disabled={aiOut}
+                                  title={aiOut ? "Daily AI budget used — resets at midnight" : "Swap for an alternative"} style={{
+                                    background: T.surface2, border: `1px solid ${T.line}`, color: aiOut ? T.dim : T.blue,
+                                    borderRadius: 8, width: 34, height: 34, cursor: aiOut ? "default" : "pointer", fontSize: 16, flexShrink: 0,
+                                    opacity: aiOut ? 0.5 : 1,
                                   }}>
                                   {swapBusy === `${openDay}-${i}` ? "…" : "⇄"}
                                 </button>
@@ -3731,13 +3854,27 @@ Respond ONLY with valid JSON, no markdown fences:
                               </div>
                             );
                           })}
-                          <button style={{ ...S.ghost, width: "100%", marginTop: 10 }}
-                            disabled={!!swapBusy}
+                          <button style={{ ...S.ghost, width: "100%", marginTop: 10, opacity: aiOut ? 0.5 : 1 }}
+                            disabled={!!swapBusy || aiOut}
+                            title={aiOut ? "Daily AI budget used — resets at midnight" : undefined}
                             onClick={() => addExercise(openDay)}>
                             {swapBusy === `add-${openDay}` ? "Asking the coach…" : "＋ Add one more exercise — I've got more in the tank"}
                           </button>
+                          <button style={{ ...S.ghost, width: "100%", marginTop: 8 }}
+                            onClick={() => { setLibAddDay(libAddDay === openDay ? null : openDay); setLibAddName(""); }}>
+                            {libAddDay === openDay ? "Close library" : "⌕ Add from the library — free, no AI call"}
+                          </button>
+                          {libAddDay === openDay && (
+                            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                              <input list="lib" value={libAddName} placeholder="Type to search…"
+                                onChange={(e) => setLibAddName(e.target.value)}
+                                onKeyDown={(e) => e.key === "Enter" && addFromLibrary()}
+                                style={{ ...S.input, marginBottom: 0, flex: 1 }} />
+                              <button style={{ ...S.ghost, whiteSpace: "nowrap" }} onClick={addFromLibrary}>Add</button>
+                            </div>
+                          )}
                           {swapNote && (
-                            <div style={{ fontSize: 12.5, color: T.blue, padding: "9px 0 0" }}>{swapNote}</div>
+                            <div style={{ fontSize: 12.5, color: swapNote.startsWith("⚠") ? T.red : T.blue, padding: "9px 0 0" }}>{swapNote}</div>
                           )}
                           {(() => {
                             const cool = cooldownFor(dy);
@@ -3799,7 +3936,9 @@ Respond ONLY with valid JSON, no markdown fences:
                     <b style={{ color: T.good }}>Coach's tip · </b><span style={{ fontSize: 14 }}>{plan.tip}</span>
                   </div>
                 )}
-                <button style={{ ...S.ghost, width: "100%" }} onClick={() => getPlan()}>Rebuild this week's plan</button>
+                <button style={{ ...S.ghost, width: "100%", opacity: aiOut ? 0.5 : 1 }} disabled={aiOut}
+                  title={aiOut ? "Daily AI budget used — resets at midnight" : undefined}
+                  onClick={() => getPlan()}>Rebuild this week's plan</button>
                 <button style={{ ...S.ghost, width: "100%", marginTop: 8 }} onClick={undoLastMutation}>Undo last plan change</button>
                 <div style={{ fontSize: 12, color: T.sub, marginTop: 8, textAlign: "center" }}>
                   Tap any exercise for form, muscles worked, and do's & don'ts.
@@ -3960,13 +4099,24 @@ Respond ONLY with valid JSON, no markdown fences:
                   if (isTimedEx(ex)) return null;
                   const ww = parseFloat(((ex.sets.find((s) => !s.done) || ex.sets[0]) || {}).weight);
                   const ramp = warmupRamp(ww);
-                  if (!ramp) return null;
+                  const pm = isBarbellName(ex.name) ? plateMath(ww) : null;
+                  if (!ramp && !pm) return null;
                   return (
                     <div style={{ background: T.surface2, borderRadius: 10, padding: "9px 12px", margin: "6px 0 8px" }}>
-                      <div style={{ ...S.label, marginBottom: 4 }}>Warm-up ramp → {ww}kg</div>
-                      <div style={{ fontSize: 13.5, color: T.sub }}>
-                        {ramp.map((r) => `${r.kg}kg × ${r.reps}`).join("   ·   ")}
-                      </div>
+                      {ramp && (
+                        <>
+                          <div style={{ ...S.label, marginBottom: 4 }}>Warm-up ramp → {ww}kg</div>
+                          <div style={{ fontSize: 13.5, color: T.sub }}>
+                            {ramp.map((r) => `${r.kg}kg × ${r.reps}`).join("   ·   ")}
+                          </div>
+                        </>
+                      )}
+                      {pm && (
+                        <div style={{ fontSize: 12.5, color: T.blue, marginTop: ramp ? 7 : 0 }}>
+                          On the bar: {pm.plates.length ? pm.plates.join(" + ") + " per side" : "empty bar"} · 20kg bar
+                          {pm.leftover ? ` (+${pm.leftover}kg won't plate)` : ""}
+                        </div>
+                      )}
                     </div>
                   );
                 })()}
@@ -4140,7 +4290,20 @@ Respond ONLY with valid JSON, no markdown fences:
         {tab === "log" && (
           <>
             <div style={S.card}>
-              <Rule label="Log a workout" />
+              <Rule label={editingId ? "Edit session" : "Log a workout"} />
+              {editingId && (
+                <div style={{
+                  background: T.goldDim, borderLeft: `2px solid ${T.gold}`, borderRadius: 8,
+                  padding: "8px 12px", marginBottom: 12, fontSize: 12.5, color: T.gold,
+                  display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10,
+                }}>
+                  <span>Editing the session from {date} — saving replaces it.</span>
+                  <button onClick={() => { setEditingId(null); setExs([emptyEx()]); setNotes(""); setDate(todayStr); }}
+                    style={{ background: "none", border: "none", color: T.gold, fontWeight: 700, fontSize: 12.5, cursor: "pointer", textDecoration: "underline", flexShrink: 0 }}>
+                    Cancel
+                  </button>
+                </div>
+              )}
               <span style={S.label}>Date</span>
               <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
                 style={{ ...S.input, marginBottom: 12, colorScheme: "dark" }} />
@@ -4177,6 +4340,11 @@ Respond ONLY with valid JSON, no markdown fences:
                         </div>
                       );
                     })()}
+                    {ex.repHint && ex.repHint.includes("-") && (
+                      <div style={{ fontSize: 12, color: T.dim, marginTop: 7 }}>
+                        Plan target: {ex.sets || "?"}×{ex.repHint} — log the reps you actually got
+                      </div>
+                    )}
                     {(() => {
                       const perf = lastPerfFor(ex.name);
                       if (!perf || (!ex.name.trim())) return null;
@@ -4208,7 +4376,6 @@ Respond ONLY with valid JSON, no markdown fences:
                   </div>
                 </div>
               ))}
-              <datalist id="lib">{LIB.map((e) => <option key={e.name} value={e.name} />)}</datalist>
               <button style={{ ...S.ghost, width: "100%", marginBottom: 12 }} onClick={() => setExs((a) => [...a, emptyEx()])}>
                 + Add exercise
               </button>
@@ -4255,6 +4422,10 @@ Respond ONLY with valid JSON, no markdown fences:
                   <span style={{ ...mono, fontSize: 13.5, color: T.text }}>{w.date}</span>
                   <div style={{ display: "flex", gap: 14, alignItems: "baseline" }}>
                     <span style={{ fontSize: 12, color: T.sub }}>{Math.round(volumeOf(w)).toLocaleString()} vol</span>
+                    <button onClick={() => editWorkout(w)}
+                      style={{ background: "none", border: "none", color: T.blue, fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+                      Edit
+                    </button>
                     <button onClick={() => delWorkout(w.id)}
                       style={{ background: "none", border: "none", color: T.red, fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
                       Delete

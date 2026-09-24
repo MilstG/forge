@@ -21,6 +21,8 @@ const babel = require2("@babel/core");
 let code = readFileSync(APP, "utf8");
 code = code.slice(0, code.indexOf("export default function Forge"));
 code = code.replace(/^import .*$/gm, "");
+/* import-stripping removes lib imports; module-scope aliases need this stub */
+code = "const parseJsonLoose = (t) => JSON.parse(String(t));\n" + code;
 code += "\nexport { photoFor, canonicalName, photoMatch, EX_NAMES };\n";
 const out = babel.transformSync(code, {
   presets: [

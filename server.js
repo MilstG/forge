@@ -158,17 +158,22 @@ app.use("/api", (req, res, next) => {
 const requireAdmin = (req, res, next) =>
   req.user && req.user.admin ? next() : res.status(403).json({ error: "admin only" });
 
-/* ---- per-user daily AI budget (admin is exempt) ---- */
-const aiUsage = (id) => {
+/* ---- per-user daily AI budget (admin is exempt) ----
+   Each user can carry their own aiLimit (set by the admin); without one
+   the global default applies. */
+const aiLimitFor = (user) =>
+  user && Number.isFinite(+user.aiLimit) && +user.aiLimit > 0 ? Math.floor(+user.aiLimit) : AI_DAILY_LIMIT;
+const aiUsage = (id, limit = AI_DAILY_LIMIT) => {
   const u = readUserJson(id, "ai-usage.json", {}) || {};
   const today = dateInTz();
-  const count = Math.min(Math.max(+u.count || 0, 0), AI_DAILY_LIMIT);
+  const count = Math.min(Math.max(+u.count || 0, 0), limit);
   return u.date === today ? { date: today, count } : { date: today, count: 0 };
 };
 const aiStatus = (user) => {
   if (user.admin) return { used: 0, limit: null, left: null };
-  const u = aiUsage(user.id);
-  return { used: u.count, limit: AI_DAILY_LIMIT, left: Math.max(0, AI_DAILY_LIMIT - u.count) };
+  const lim = aiLimitFor(user);
+  const u = aiUsage(user.id, lim);
+  return { used: u.count, limit: lim, left: Math.max(0, lim - u.count) };
 };
 
 app.get("/api/health", (_req, res) => {
@@ -271,10 +276,16 @@ app.post("/api/auth/password", (req, res) => {
   if (!user) return res.status(400).json({ error: "user not found" });
   user.salt = crypto.randomBytes(16).toString("hex");
   user.hash = hashPassword(next, user.salt);
-  store.sessions = (store.sessions || []).filter((x) => x.userId !== user.id); // re-login on all devices
+  /* other devices must re-login, but THIS one gets fresh credentials so a
+     password change never re-stores the plaintext password client-side */
+  store.sessions = (store.sessions || []).filter((x) => x.userId !== user.id);
+  const token = crypto.randomBytes(24).toString("hex");
+  const deviceToken = crypto.randomBytes(24).toString("hex");
+  store.sessions.push({ token, userId: user.id, exp: Date.now() + 30 * 24 * 3600 * 1000, at: Date.now() });
+  store.sessions.push({ token: deviceToken, userId: user.id, exp: Date.now() + 180 * 24 * 3600 * 1000, at: Date.now(), device: true });
   saveUsers(store);
-  res.setHeader("Set-Cookie", "forge_session=; HttpOnly; Path=/; Max-Age=0");
-  res.json({ ok: true });
+  res.setHeader("Set-Cookie", `forge_session=${token}; ${cookieFlags()}`);
+  res.json({ ok: true, deviceToken });
 });
 
 /* ---- admin: manage users ---- */
@@ -282,9 +293,26 @@ app.get("/api/users", requireAdmin, (req, res) => {
   res.json((usersFile().users || []).map((u) => ({
     id: u.id, name: u.name, admin: !!u.admin, lastLogin: u.lastLogin || null,
     whoop: !!((readUserJson(u.id, "whoop.json", null) || {}).access_token),
-    aiToday: u.admin ? null : aiUsage(u.id).count,
-    aiLimit: u.admin ? null : AI_DAILY_LIMIT,
+    aiToday: u.admin ? null : aiUsage(u.id, aiLimitFor(u)).count,
+    aiLimit: u.admin ? null : aiLimitFor(u),
   })));
+});
+/* per-user AI budget: {limit: N} sets it, {limit: null} restores the default */
+app.post("/api/users/:id/ai-limit", requireAdmin, (req, res) => {
+  const store = usersFile();
+  const user = (store.users || []).find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: "user not found" });
+  if (user.admin) return res.status(400).json({ error: "the admin has no AI limit" });
+  const raw = req.body && req.body.limit;
+  if (raw == null || raw === "") {
+    delete user.aiLimit;
+  } else {
+    const n = Math.floor(+raw);
+    if (!Number.isFinite(n) || n < 1 || n > 100) return res.status(400).json({ error: "limit must be 1-100 or null" });
+    user.aiLimit = n;
+  }
+  saveUsers(store);
+  res.json({ ok: true, aiLimit: aiLimitFor(user) });
 });
 app.post("/api/users", requireAdmin, (req, res) => {
   const name = String((req.body && req.body.name) || "").trim().slice(0, 24);
@@ -785,41 +813,43 @@ async function callAI(prompt, maxTokens = 1500) {
    first and incrementing after the (slow) call is a race: two requests in
    flight both pass the check and the counter overshoots the cap. A failed
    call refunds its slot so errors don't eat the daily budget. */
-const aiReserve = (userId) => {
-  const u = aiUsage(userId);
-  if (u.count >= AI_DAILY_LIMIT) return null;
+const aiReserve = (user) => {
+  const lim = aiLimitFor(user);
+  const u = aiUsage(user.id, lim);
+  if (u.count >= lim) return null;
   u.count += 1;
-  writeUserJson(userId, "ai-usage.json", u);
+  writeUserJson(user.id, "ai-usage.json", u);
   return u;
 };
-const aiRefund = (userId, date) => {
+const aiRefund = (user, date) => {
   try {
-    const u = aiUsage(userId);
+    const u = aiUsage(user.id, aiLimitFor(user));
     if (u.date === date && u.count > 0) {
       u.count -= 1;
-      writeUserJson(userId, "ai-usage.json", u);
+      writeUserJson(user.id, "ai-usage.json", u);
     }
   } catch (e) {}
 };
 app.post("/api/claude", async (req, res) => {
   let reserved = null;
+  const lim = aiLimitFor(req.user);
   if (!req.user.admin) {
-    reserved = aiReserve(req.user.id);
+    reserved = aiReserve(req.user);
     if (!reserved) {
       return res.status(429).json({
-        error: `Daily AI limit reached (${AI_DAILY_LIMIT} calls). It resets at midnight.`,
-        ai: { used: AI_DAILY_LIMIT, limit: AI_DAILY_LIMIT, left: 0 },
+        error: `Daily AI limit reached (${lim} calls). It resets at midnight.`,
+        ai: { used: lim, limit: lim, left: 0 },
       });
     }
   }
   try {
     const text = await callAI(req.body.prompt, +req.body.max_tokens || 1500);
     const ai = reserved
-      ? { used: reserved.count, limit: AI_DAILY_LIMIT, left: Math.max(0, AI_DAILY_LIMIT - reserved.count) }
+      ? { used: reserved.count, limit: lim, left: Math.max(0, lim - reserved.count) }
       : null;
     res.json({ text, ai });
   } catch (e) {
-    if (reserved) aiRefund(req.user.id, reserved.date);
+    if (reserved) aiRefund(req.user, reserved.date);
     console.error("[ai]", String(e.message || e));
     res.status(502).json({ error: String(e.message || e) });
   }
@@ -868,13 +898,12 @@ const weekdayIdxInTz = () => {
   return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].indexOf(wd);
 };
 
-async function autoAdjustCheck() {
+/* Runs for EVERY user with a plan and WHOOP connected, not just the admin.
+   At most one adjustment per user per day; goes through the server's AI key
+   and never touches the user's own daily budget. */
+async function autoAdjustFor(user) {
   try {
-    if ((process.env.AUTO_ADJUST || "on") === "off") return;
-    if (!PROVIDER) return;
-    const adminUser = (usersFile().users || []).find((u) => u.admin);
-    if (!adminUser) return;
-    const adminId = adminUser.id;
+    const adminId = user.id;
     const data = readUserJson(adminId, "forge.json", null);
     if (!data || !data.profile || !data.plan || !Array.isArray(data.plan.week)) return;
     const today = dateInTz();
@@ -925,16 +954,17 @@ Respond ONLY with valid JSON, no markdown fences:
     }, { today, todayIdx: idx, neverSwapCompounds: !!p.neverSwapCompounds });
     delete data.plan.adjustUndone;
     writeUserJson(adminId, "forge.json", data);
-    console.log(`[auto-adjust] ${today}: ${dy.day} adjusted for ${reason.summary}`);
+    console.log(`[auto-adjust] ${today} (${user.name}): ${dy.day} adjusted for ${reason.summary}`);
   } catch (e) {
-    console.error("[auto-adjust] failed:", String(e.message || e));
+    console.error(`[auto-adjust] failed for ${user.name}:`, String(e.message || e));
   }
 }
 /* Every 15 min: pull WHOOP so the history file and cache stay current even
    when the app is closed. Goes through the cache, so it's a real WHOOP call
    only when the cached copy has expired. Then run the auto-adjust check. */
 async function whoopPoll() {
-  for (const u of usersFile().users || []) {
+  const users = usersFile().users || [];
+  for (const u of users) {
     try {
       const t = readUserJson(u.id, "whoop.json", null);
       if (!t || !t.access_token) continue;
@@ -943,7 +973,8 @@ async function whoopPoll() {
       if (!c.data || Date.now() - c.at >= ttl) await fetchWhoopSummary(u.id);
     } catch (e) { console.error("[whoop] poll failed:", u.name, String(e.message || e)); }
   }
-  await autoAdjustCheck();
+  if ((process.env.AUTO_ADJUST || "on") === "off" || !PROVIDER) return;
+  for (const u of users) await autoAdjustFor(u);
 }
 setInterval(whoopPoll, 15 * 60 * 1000);
 setTimeout(whoopPoll, 20 * 1000); // and shortly after boot
