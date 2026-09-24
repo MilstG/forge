@@ -176,6 +176,14 @@ r = await call("POST", "/api/auth/login", { body: { userId: juanId, password: "t
 ok(r.status === 401, "old password dead after reset");
 r = await call("POST", "/api/auth/login", { body: { userId: juanId, password: "newpw99" }, as: "juan" });
 ok(r.status === 200, "new password works");
+r = await call("POST", "/api/auth/password", { as: "juan", body: { current: "newpw99", next: "fresh1234" } });
+ok(r.status === 200 && typeof r.json.deviceToken === "string" && r.json.deviceToken.length >= 32,
+  "self password change returns a fresh device token");
+const juanNewDevice = r.json.deviceToken;
+r = await call("GET", "/api/auth/me", { as: "juan" });
+ok(r.status === 200, "the changing device stays logged in via the new cookie");
+r = await call("GET", "/api/auth/me", { token: juanNewDevice });
+ok(r.status === 200, "the fresh device token authenticates");
 r = await call("DELETE", `/api/users/${admin.id}`, { as: "admin" });
 ok(r.status === 400, "admin account cannot be removed");
 r = await call("DELETE", `/api/users/${juanId}`, { as: "admin" });
@@ -212,6 +220,25 @@ r = await call("GET", "/api/users", { as: "admin" });
 ok(r.json.find((u) => u.id === rafaId).aiToday === 0, "failed call did not consume the budget");
 r = await call("POST", "/api/claude", { as: "rafa", body: { prompt: "hi" } });
 ok(r.status === 200 && r.json.ai.used === 1, "next successful call counts normally");
+
+console.log("per-user AI limit");
+r = await call("POST", `/api/users/${rafaId}/ai-limit`, { as: "admin", body: { limit: 2 } });
+ok(r.status === 200 && r.json.aiLimit === 2, "admin sets rafa's daily limit to 2");
+r = await call("GET", "/api/auth/me", { as: "rafa" });
+ok(r.json.ai.limit === 2 && r.json.ai.used === 1, "rafa's status reflects the custom limit");
+r = await call("POST", "/api/claude", { as: "rafa", body: { prompt: "hi" } });
+ok(r.status === 200 && r.json.ai.left === 0, "second call fills the custom budget");
+r = await call("POST", "/api/claude", { as: "rafa", body: { prompt: "hi" } });
+ok(r.status === 429, "third call blocked at the custom limit");
+r = await call("POST", `/api/users/${rafaId}/ai-limit`, { as: "admin", body: { limit: null } });
+ok(r.status === 200 && r.json.aiLimit === 10, "clearing the limit restores the default");
+r = await call("POST", "/api/claude", { as: "rafa", body: { prompt: "hi" } });
+ok(r.status === 200 && r.json.ai.limit === 10, "rafa can call again under the default limit");
+r = await call("POST", `/api/users/${rafaId}/ai-limit`, { as: "admin", body: { limit: 500 } });
+ok(r.status === 400, "out-of-range limit rejected");
+const adminRow = await call("GET", "/api/users", { as: "admin" });
+r = await call("POST", `/api/users/${adminRow.json.find((u) => u.admin).id}/ai-limit`, { as: "admin", body: { limit: 5 } });
+ok(r.status === 400, "cannot put a limit on the admin");
 
 console.log("second boot is a no-op");
 const before = JSON.stringify(JSON.parse(fs.readFileSync(path.join(DATA, "users.json"), "utf8")).users.map((u) => u.id));

@@ -1,6 +1,4 @@
-/* Runs every suite and exits non-zero if any fails, so CI can gate on it.
-   photo-coverage and strength-standards are excluded: they have been red on
-   main since before CI existed — re-add them here once fixed. */
+/* Runs every suite and exits non-zero if any fails, so CI can gate on it. */
 import { spawnSync } from "child_process";
 
 const suites = [
@@ -12,6 +10,8 @@ const suites = [
   "test/push-pruning.mjs",
   "test/push-rules.mjs",
   "test/sw-behaviour.mjs",
+  "test/photo-coverage.mjs",
+  "test/strength-standards.mjs",
   "test/multi-user.mjs",
 ];
 

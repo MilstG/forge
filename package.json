@@ -18,6 +18,9 @@
     "web-push": "^3.6.7"
   },
   "devDependencies": {
+    "@babel/core": "^8.0.6",
+    "@babel/preset-env": "^8.0.6",
+    "@babel/preset-react": "^8.0.1",
     "@vitejs/plugin-react": "^4.3.1",
     "vite": "^5.4.0"
   }
